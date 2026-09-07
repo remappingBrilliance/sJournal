@@ -1,0 +1,208 @@
+package store
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"sjournal/internal/crypto"
+)
+
+func TestNextNumberedNameSequencing(t *testing.T) {
+	dir := t.TempDir()
+
+	name, err := NextNumberedName(dir, "TODO")
+	if err != nil || name != "TODO001.md" {
+		t.Fatalf("got %q, %v; want TODO001.md", name, err)
+	}
+
+	for _, n := range []string{"TODO001.md", "TODO002.md", "TODO005.md"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	name, err = NextNumberedName(dir, "TODO")
+	if err != nil || name != "TODO006.md" {
+		t.Fatalf("got %q, %v; want TODO006.md", name, err)
+	}
+}
+
+func TestListNumberedDescending(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"NOTES001.md", "NOTES003.md", "NOTES002.md"} {
+		os.WriteFile(filepath.Join(dir, n), []byte("x\n"), 0o600)
+	}
+	got, err := ListNumbered(dir, "NOTES")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"NOTES003.md", "NOTES002.md", "NOTES001.md"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestMostRecentFilePicksNewestAcrossKinds(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "2020-01-01.md")
+	newer := filepath.Join(dir, "TODO001.md")
+	os.WriteFile(old, []byte("a\n"), 0o600)
+	time.Sleep(20 * time.Millisecond)
+	os.WriteFile(newer, []byte("b\n"), 0o600)
+
+	path, ok, err := MostRecentFile(dir)
+	if err != nil || !ok {
+		t.Fatalf("err=%v ok=%v", err, ok)
+	}
+	if path != newer {
+		t.Fatalf("got %q, want %q", path, newer)
+	}
+}
+
+func TestMostRecentFileEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	_, ok, err := MostRecentFile(dir)
+	if err != nil || ok {
+		t.Fatalf("err=%v ok=%v, want ok=false", err, ok)
+	}
+}
+
+func TestAppendAndReadLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "2026-09-07.md")
+	if err := AppendLine(path, "line1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendLine(path, "line2"); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := ReadLines(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 || lines[0] != "line1" || lines[1] != "line2" {
+		t.Fatalf("got %v", lines)
+	}
+}
+
+// TestConsolidatePreservesOrderAndMigratesUnlocked exercises the actual
+// spec-critical behavior: consecutive decrypted runs merge into one new
+// block each, still-encrypted blocks are left untouched and in place, and a
+// block unlocked via a one-off password this session gets folded in.
+func TestConsolidatePreservesOrderAndMigratesUnlocked(t *testing.T) {
+	codec := crypto.NewCodec()
+	const sessionPW = "current-password"
+	const oldPW = "old-password"
+
+	line1, _ := codec.Encrypt(sessionPW, "entry one")
+	line2, _ := codec.Encrypt(sessionPW, "entry two")
+	lockedLine, _ := codec.Encrypt(oldPW, "old secret")
+	line3, _ := codec.Encrypt(sessionPW, "entry three")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "2026-09-07.md")
+	for _, l := range []string{line1, line2, lockedLine, line3} {
+		if err := AppendLine(path, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	blocks, err := LoadDocument(path, codec, []string{sessionPW})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 4 {
+		t.Fatalf("got %d blocks, want 4", len(blocks))
+	}
+	if !blocks[0].Decrypted || !blocks[1].Decrypted || blocks[2].Decrypted || !blocks[3].Decrypted {
+		t.Fatalf("unexpected decrypt state: %+v %+v %+v %+v", blocks[0], blocks[1], blocks[2], blocks[3])
+	}
+
+	// First consolidation: the locked block stays locked, so blocks 1+2
+	// merge into one new block, block 3 (locked) passes through unchanged,
+	// block 4 becomes its own new block (nothing to merge with across the
+	// locked gap).
+	lines, err := Consolidate(blocks, sessionPW, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3: %v", len(lines), lines)
+	}
+	if lines[1] != lockedLine {
+		t.Fatalf("locked block was not preserved byte-for-byte in place: got %q want %q", lines[1], lockedLine)
+	}
+	merged, err := codec.Decrypt(sessionPW, lines[0])
+	if err != nil {
+		t.Fatalf("merged block should decrypt with session password: %v", err)
+	}
+	if merged != "entry one\nentry two" {
+		t.Fatalf("got merged plaintext %q", merged)
+	}
+
+	// Now unlock the still-locked block with its one-off password and
+	// confirm it migrates onto the session password on the next save.
+	if !TryUnlock(blocks[2], oldPW, codec) {
+		t.Fatal("TryUnlock should have succeeded with the correct one-off password")
+	}
+	if !blocks[2].Migrated {
+		t.Fatal("block should be marked Migrated after a successful one-off unlock")
+	}
+
+	lines2, err := Consolidate(blocks, sessionPW, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines2) != 1 {
+		t.Fatalf("all blocks should now merge into a single new block, got %d: %v", len(lines2), lines2)
+	}
+	final, err := codec.Decrypt(sessionPW, lines2[0])
+	if err != nil {
+		t.Fatalf("final consolidated block should decrypt under the session password: %v", err)
+	}
+	if final != "entry one\nentry two\nold secret\nentry three" {
+		t.Fatalf("got %q", final)
+	}
+
+	// The old password must no longer be needed at all: re-loading with only
+	// the session password decrypts every block after the migration+save.
+	if err := WriteLines(path, lines2); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadDocument(path, codec, []string{sessionPW})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded) != 1 || !reloaded[0].Decrypted {
+		t.Fatalf("expected the single migrated block to decrypt under session password alone: %+v", reloaded)
+	}
+}
+
+func TestConsolidateDropsRemovedBlocks(t *testing.T) {
+	codec := crypto.NewCodec()
+	const pw = "pw"
+	l1, _ := codec.Encrypt(pw, "keep me")
+	l2, _ := codec.Encrypt(pw, "- [ ] delete me")
+
+	blocks := []*Block{
+		{Raw: l1, Plaintext: "keep me", Decrypted: true},
+		{Raw: l2, Plaintext: "- [ ] delete me", Decrypted: true, Removed: true},
+	}
+	lines, err := Consolidate(blocks, pw, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1 (removed block dropped)", len(lines))
+	}
+	pt, err := codec.Decrypt(pw, lines[0])
+	if err != nil || pt != "keep me" {
+		t.Fatalf("pt=%q err=%v", pt, err)
+	}
+}
