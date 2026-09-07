@@ -206,3 +206,61 @@ func TestConsolidateDropsRemovedBlocks(t *testing.T) {
 		t.Fatalf("pt=%q err=%v", pt, err)
 	}
 }
+
+// TestEncryptIndividuallyNeverMerges is the regression test for the bug
+// where Todo saves were merging every checklist item into one chunk
+// (Consolidate's behavior, correct for Journal/Notes but wrong for Todo:
+// each item must stay independently editable/decryptable).
+func TestEncryptIndividuallyNeverMerges(t *testing.T) {
+	codec := crypto.NewCodec()
+	const pw = "pw"
+	const oldPW = "old-pw"
+
+	l1, _ := codec.Encrypt(pw, "- [ ] item one")
+	l2, _ := codec.Encrypt(pw, "- [x] item two")
+	lockedLine, _ := codec.Encrypt(oldPW, "- [ ] old item")
+
+	blocks := []*Block{
+		{Raw: l1, Plaintext: "- [ ] item one", Decrypted: true},
+		{Raw: l2, Plaintext: "- [x] item two", Decrypted: true},
+		{Raw: lockedLine, Decrypted: false},
+	}
+
+	lines, err := EncryptIndividually(blocks, pw, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3 (one per block, no merging): %v", len(lines), lines)
+	}
+	if lines[2] != lockedLine {
+		t.Fatalf("locked block should pass through unchanged")
+	}
+	pt1, err := codec.Decrypt(pw, lines[0])
+	if err != nil || pt1 != "- [ ] item one" {
+		t.Fatalf("pt1=%q err=%v", pt1, err)
+	}
+	pt2, err := codec.Decrypt(pw, lines[1])
+	if err != nil || pt2 != "- [x] item two" {
+		t.Fatalf("pt2=%q err=%v", pt2, err)
+	}
+}
+
+func TestEncryptIndividuallyDropsRemoved(t *testing.T) {
+	codec := crypto.NewCodec()
+	const pw = "pw"
+	l1, _ := codec.Encrypt(pw, "- [ ] keep")
+	l2, _ := codec.Encrypt(pw, "- [ ] drop")
+
+	blocks := []*Block{
+		{Raw: l1, Plaintext: "- [ ] keep", Decrypted: true},
+		{Raw: l2, Plaintext: "- [ ] drop", Decrypted: true, Removed: true},
+	}
+	lines, err := EncryptIndividually(blocks, pw, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1", len(lines))
+	}
+}

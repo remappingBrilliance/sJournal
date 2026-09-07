@@ -253,6 +253,28 @@ func safeFocus(win fyne.Window, obj fyne.CanvasObject) {
 	}
 }
 
+// deferFocus focuses obj once it's actually attached to the canvas. A
+// widget added to a container this same tick isn't attached yet —
+// Fyne registers it in the canvas's object cache during the next
+// layout/paint pass, not synchronously on Refresh() — so unlike safeFocus
+// (a one-shot best-effort check), this retries for a short while.
+func deferFocus(win fyne.Window, obj fyne.CanvasObject) {
+	var attempt func(remaining int)
+	attempt = func(remaining int) {
+		if fyne.CurrentApp().Driver().CanvasForObject(obj) != nil {
+			safeFocus(win, obj)
+			return
+		}
+		if remaining <= 0 {
+			return
+		}
+		time.AfterFunc(16*time.Millisecond, func() {
+			fyne.Do(func() { attempt(remaining - 1) })
+		})
+	}
+	attempt(10)
+}
+
 func (t *FileTab) showEditMode() {
 	blocks, err := store.LoadDocument(t.path(t.currentFile), t.sess.Codec, []string{t.sess.Password})
 	if err != nil {

@@ -100,3 +100,29 @@ func Consolidate(blocks []*Block, sessionPassword string, codec *crypto.Codec) (
 	}
 	return out, nil
 }
+
+// EncryptIndividually re-encrypts each decrypted block on its own — no
+// merging across blocks — under sessionPassword, leaving still-encrypted
+// blocks byte-for-byte unchanged and dropping Removed ones. Unlike
+// Consolidate, this preserves one-block-per-chunk boundaries, which Todo
+// files rely on: each chunk may hold one or more checklist items (parsed
+// from its decrypted markdown), and merging chunks together on every save
+// would keep folding old items into new ones.
+func EncryptIndividually(blocks []*Block, sessionPassword string, codec *crypto.Codec) ([]string, error) {
+	var out []string
+	for _, b := range blocks {
+		if b.Removed {
+			continue
+		}
+		if !b.Decrypted {
+			out = append(out, b.Raw)
+			continue
+		}
+		line, err := codec.Encrypt(sessionPassword, b.Plaintext)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
