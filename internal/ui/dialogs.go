@@ -74,24 +74,33 @@ func ShowChoice(win fyne.Window, title, message string, labels []string, onChoic
 }
 
 // ShowTextEntry shows a modal popup with a multi-line text entry and a
-// single submit button.
+// single submit button. Enter submits; Shift+Enter inserts a newline (the
+// same convention as the main Enter-Mode boxes).
 func ShowTextEntry(win fyne.Window, title, message, submitLabel string, onSubmit func(text string)) {
-	entry := widget.NewMultiLineEntry()
-	entry.Wrapping = fyne.TextWrapWord
-
 	var popup *widget.PopUp
-	submit := widget.NewButton(submitLabel, nil)
-	submit.Importance = widget.HighImportance
-	submit.OnTapped = func() {
+	var entry *EnterModeEntry
+
+	submitted := false
+	submit := func() {
+		if submitted {
+			return
+		}
+		submitted = true
 		text := entry.Text
 		popup.Hide()
 		onSubmit(text)
 	}
 
+	entry = NewEnterModeEntry(func(string) { submit() })
+	entry.SetPlaceHolder("Enter to add · Shift+Enter for a new line")
+
+	submitBtn := widget.NewButton(submitLabel, submit)
+	submitBtn.Importance = widget.HighImportance
+
 	content := container.NewVBox(
 		widget.NewLabel(message),
 		entry,
-		container.NewHBox(layout.NewSpacer(), submit),
+		container.NewHBox(layout.NewSpacer(), submitBtn),
 	)
 	card := widget.NewCard(title, "", content)
 

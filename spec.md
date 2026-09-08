@@ -5,10 +5,11 @@ A secure journal that is portable across operating systems, requires no installa
 # Technology
 
 - **Language:** Go
-- **GUI toolkit:** [Fyne](https://fyne.io/) — pure Go, compiles to a single static cross-platform binary, no bundled runtime, good fit for "no installation."
+- **GUI toolkit:** [Fyne](https://fyne.io/) — pure Go, compiles to a single static cross-platform binary, no bundled runtime, good fit for "no installation." On Linux, `build.sh` compiles the native Wayland backend (`-tags wayland`) on a Wayland session so the window carries an `app_id` GNOME can match to the installed `.desktop` (otherwise it runs under XWayland with a generic taskbar icon); `SJOURNAL_X11=1` forces the portable X11/XWayland build.
 - **Encryption:** AES-256-GCM (authenticated encryption)
 - **Key derivation:** Argon2id
 - **Distribution:** single binary; on first run it creates its own data folder next to itself. No installer, no system-wide state.
+    - Optional installers (`packaging/`) add a Start Menu / applications-menu entry, an icon, and a `.desktop` file whose basename matches the Fyne app ID (`io.lottkowitz.sjournal`) so Wayland compositors can resolve the app's notifications. When installed, `SJOURNAL_HOME` (env var) points the binary at a data folder in the user's profile instead of the install tree. The portable single-binary mode is unchanged and remains the default.
 
 # Data & File Layout
 
@@ -85,7 +86,7 @@ Every block is fully self-contained: it carries its own salt and nonce, so any s
 - **Timestamp checkbox:** when checked, each new entry is prefixed with `[HH:mm] ` (the time at which the user typed the first character of that entry), producing plaintext like `[HH:mm] <user text>` before encryption. The checkbox's on/off state persists across restarts as a default in `config.yaml`, but can be toggled per-session.
 - **Remind-me feature** (configured via Settings):
     - Set a start time and end time of day, and an interval.
-    - While within that window, at each interval boundary the app chimes (system beep) and pops up a reminder.
+    - While within that window, at each interval boundary the app chimes (a short best-effort notification sound — `canberra`/`paplay` on Linux, `[console]::beep` on Windows, `afplay` on macOS; silently skipped if none is available), sends a desktop notification, and pops up a reminder. On Linux the notification is sent via `notify-send`/`gdbus` (reliable under Wayland) with a fallback to Fyne's built-in D-Bus path. If the window was minimized to the tray, the reminder restores it so the prompt is visible.
         - The first popup requires an explicit **[OK]** dismissal before the actual "add journal entry" prompt appears — this prevents an in-progress keystroke's Enter from being swallowed as the reminder's dismissal and accidentally saving a blank entry.
         - The user may submit an empty entry at the reminder prompt; it is discarded without writing anything to the file.
         - If the app is in **Edit Mode** when a reminder fires, the popup instead offers **[OK]** / **[Ignore]**: OK switches to the Journal tab in Enter Mode, scrolled/positioned at the end of all current text; Ignore is a no-op.
@@ -134,6 +135,8 @@ Everything in `config.yaml` is editable from the Settings screen, **except** pro
 - `timestamp_default` (bool) — default state of the Journal tab's "prefix timestamp" checkbox.
 - `notes_folder` (path) — override for where the `notes/` data folder lives (default: next to the executable).
 - `single_instance` (bool) — whether to enforce the PID-checked lock file on startup (default: on).
+- `require_password_for_edit` (bool) — re-prompt for the session password when switching into Edit Mode (default: off).
+- `minimize_to_tray` (bool) — make the window's close button hide to the system tray instead of quitting (default: off). Requires a system tray; on GNOME that means the AppIndicator shell extension, otherwise the close button quits as normal. The tray menu has **Show sJournal** and **Quit**.
 
 # Open items / explicitly out of scope
 

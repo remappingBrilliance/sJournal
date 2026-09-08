@@ -27,6 +27,10 @@ type Config struct {
 	// RequirePasswordForEdit, when true, prompts for the session password
 	// again each time the user switches from Enter Mode into Edit Mode.
 	RequirePasswordForEdit bool `yaml:"require_password_for_edit"`
+	// MinimizeToTray, when true, makes the window's close button hide the
+	// window to the system tray instead of quitting. Ignored if the desktop
+	// environment provides no system tray.
+	MinimizeToTray bool `yaml:"minimize_to_tray"`
 
 	// mu guards RemindMe, which is read by the reminder ticker's background
 	// goroutine and written from the Settings screen on the UI goroutine.
@@ -63,6 +67,7 @@ func defaults(execDir string) *Config {
 		NotesFolder:            filepath.Join(execDir, "notes"),
 		SingleInstance:         true,
 		RequirePasswordForEdit: false,
+		MinimizeToTray:         false,
 		path:                   filepath.Join(execDir, FileName),
 	}
 }

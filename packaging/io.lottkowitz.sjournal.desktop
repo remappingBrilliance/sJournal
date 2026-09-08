@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=sJournal
+GenericName=Encrypted Journal
+Comment=A secure, portable journal with the simplicity of Notepad
+Exec=__EXEC__
+Icon=io.lottkowitz.sjournal
+Terminal=false
+Categories=Utility;TextEditor;
+Keywords=journal;diary;notes;todo;encrypted;
+StartupNotify=true
+StartupWMClass=io.lottkowitz.sjournal

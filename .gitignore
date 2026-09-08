@@ -1,4 +1,6 @@
 /sjournal
+/sjournal.exe
 /.buildlibs/
 /notes/
 /config.yaml
+/packaging/dist/

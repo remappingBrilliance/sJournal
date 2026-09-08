@@ -12,4 +12,9 @@ type Session struct {
 	NotesDir string
 	Codec    *crypto.Codec
 	Password string
+
+	// TrayEnabled is true when a usable system tray was registered at
+	// startup (see ui.SystemTray). MinimizeToTray is only honored when this
+	// is true.
+	TrayEnabled bool
 }
