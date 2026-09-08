@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"time"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 )
@@ -81,10 +83,22 @@ func (a *App) surface() {
 // stashToTray hides the main window and records that it's parked in the
 // tray. Also withdraws any outstanding sJournal desktop notifications so a
 // handled reminder banner doesn't linger.
+//
+// The Hide() is deferred one tick: when this is reached from inside a
+// key-event handler (Enter on the reminder entry popup) the Wayland backend
+// silently ignores hiding the surface whose own event is being dispatched.
+// The mouse path doesn't hit that, which is why clicking "Add" worked but
+// pressing Enter left the window up.
 func (a *App) stashToTray() {
 	a.hiddenToTray = true
-	a.win.Hide()
 	DismissNotifications()
+	time.AfterFunc(0, func() {
+		fyne.Do(func() {
+			if a.hiddenToTray { // still wanted (not re-surfaced in the meantime)
+				a.win.Hide()
+			}
+		})
+	})
 }
 
 // onCloseRequested runs when the window's close button is pressed. With
