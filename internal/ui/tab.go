@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -34,9 +35,22 @@ type FileTab struct {
 	dirty       bool
 	currentFile string
 
+	// journalPinned is set when the user has deliberately selected a
+	// non-today journal date from the dropdown, which suppresses the
+	// automatic midnight roll-over in handleEnter.
+	journalPinned bool
+
 	fileSelect     *widget.Select
 	modeBtn        *widget.Button
 	timestampCheck *widget.Check
+
+	// The Todo/Notes dropdown shows a friendly label (a file's leading "#"
+	// heading) rather than its filename. These map between the two; currentFile
+	// stays a filename everywhere else. titleCache memoises the per-file
+	// decrypt-and-parse, keyed on modtime.
+	fileForDisplay map[string]string
+	displayForFile map[string]string
+	titleCache     map[string]titleCacheEntry
 
 	center     *fyne.Container
 	enterEntry *EnterModeEntry
@@ -45,14 +59,20 @@ type FileTab struct {
 	root *fyne.Container
 }
 
-func newFileTab(win fyne.Window, sess *Session, kind tabKind) *FileTab {
-	t := &FileTab{win: win, sess: sess, kind: kind}
+type titleCacheEntry struct {
+	mod   time.Time
+	label string // the file's "#" heading, or "" if none / undecryptable
+}
 
-	t.fileSelect = widget.NewSelect(nil, func(name string) {
+func newFileTab(win fyne.Window, sess *Session, kind tabKind) *FileTab {
+	t := &FileTab{win: win, sess: sess, kind: kind, titleCache: map[string]titleCacheEntry{}}
+
+	t.fileSelect = widget.NewSelect(nil, func(label string) {
+		name := t.fileForDisplay[label]
 		if name == "" || name == t.currentFile {
 			return
 		}
-		prevSelection := t.currentFile
+		prevSelection := t.displayForFile[t.currentFile]
 		t.guardUnsaved(
 			func() { t.openFile(name) },
 			func() { t.fileSelect.SetSelected(prevSelection) },
@@ -145,8 +165,53 @@ func (t *FileTab) refreshFileList() {
 	if t.currentFile != "" && !contains(files, t.currentFile) {
 		options = append([]string{t.currentFile}, files...)
 	}
-	t.fileSelect.Options = options
-	t.fileSelect.SetSelected(t.currentFile)
+
+	t.fileForDisplay = make(map[string]string, len(options))
+	t.displayForFile = make(map[string]string, len(options))
+	labels := make([]string, 0, len(options))
+	for _, name := range options {
+		label := t.displayLabel(name)
+		if _, clash := t.fileForDisplay[label]; clash {
+			// The Select widget keys purely on the label string, so a
+			// duplicate heading has to be made unique — tag it with its file.
+			label = fmt.Sprintf("%s  (%s)", label, name)
+		}
+		t.fileForDisplay[label] = name
+		t.displayForFile[name] = label
+		labels = append(labels, label)
+	}
+
+	t.fileSelect.Options = labels
+	t.fileSelect.SetSelected(t.displayForFile[t.currentFile])
+}
+
+// displayLabel is the dropdown text for a note file: its leading Markdown
+// "#" heading when the first block has one and decrypts, otherwise the
+// filename. Journal files always show their date filename.
+func (t *FileTab) displayLabel(name string) string {
+	if t.kind == kindJournal {
+		return name
+	}
+	path := t.path(name)
+	info, err := os.Stat(path)
+	if err != nil {
+		return name // pending file, not written yet
+	}
+	if c, ok := t.titleCache[name]; ok && c.mod.Equal(info.ModTime()) {
+		if c.label != "" {
+			return c.label
+		}
+		return name
+	}
+	label := ""
+	if title, ok := store.FileTitle(path, t.sess.Codec, []string{t.sess.Password}); ok {
+		label = title
+	}
+	t.titleCache[name] = titleCacheEntry{mod: info.ModTime(), label: label}
+	if label != "" {
+		return label
+	}
+	return name
 }
 
 func contains(list []string, s string) bool {
@@ -160,6 +225,9 @@ func contains(list []string, s string) bool {
 
 func (t *FileTab) openFile(name string) {
 	t.currentFile = name
+	if t.kind == kindJournal {
+		t.journalPinned = name != store.TodayJournalName()
+	}
 	t.refreshFileList()
 	if t.editMode {
 		t.showEditMode()
@@ -314,12 +382,35 @@ func (t *FileTab) handleEnter(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
+
+	// If the app was left running past midnight, the Journal tab is still
+	// pointed at what was "today" when it opened. Roll it forward to the
+	// real today's file (creating it on this first entry) so the entry
+	// lands under the right date instead of yesterday — unless the user
+	// deliberately selected an older date to write into.
+	if t.kind == kindJournal && !t.journalPinned {
+		today := store.TodayJournalName()
+		if t.currentFile != today {
+			t.currentFile = today
+			t.refreshFileList()
+		}
+	}
+
 	plain := text
 	if t.kind == kindJournal && t.timestampCheck != nil && t.timestampCheck.Checked {
 		plain = fmt.Sprintf("[%s] %s", time.Now().Format("15:04"), text)
 	}
 	if t.kind == kindTodo {
-		plain = fmt.Sprintf("- [ ] %s", text)
+		if store.IsHeadingLine(text) {
+			// "# Title" typed into a Todo list is stored verbatim as its own
+			// block — a heading, not a checklist item.
+			plain = strings.TrimSpace(text)
+		} else {
+			// Leading whitespace (spaces, or a Tab) nests the new item.
+			depth := min(store.IndentDepth(text), todoMaxDepth)
+			plain = fmt.Sprintf("%s- [ ] %s",
+				strings.Repeat(store.TodoIndentUnit, depth), strings.TrimLeft(text, " \t"))
+		}
 	}
 
 	line, err := t.sess.Codec.Encrypt(t.sess.Password, plain)
@@ -337,8 +428,22 @@ func (t *FileTab) handleEnter(text string) {
 // IsDirty reports whether this tab currently has unsaved Edit Mode changes.
 func (t *FileTab) IsDirty() bool { return t.editMode && t.dirty }
 
-// JumpToEnd switches to Enter Mode (used when a reminder popup's OK is
-// pressed while this tab was in Edit Mode).
-func (t *FileTab) JumpToEnd() {
-	t.guardUnsaved(func() { t.showEnterMode() }, nil)
+// AbsorbReminderEntry keeps the Journal tab consistent after a reminder
+// window has appended a line to today's file on its own. It mirrors the
+// midnight roll-over from handleEnter, refreshes the file dropdown, and — if
+// the tab is sitting in Edit Mode on today's file — folds the new line into
+// the live editor so a subsequent save (a full-file rewrite) doesn't drop
+// it.
+func (t *FileTab) AbsorbReminderEntry(plain string) {
+	today := store.TodayJournalName()
+	if t.currentFile != today && !t.journalPinned {
+		t.currentFile = today
+	}
+	if t.currentFile != today {
+		return
+	}
+	t.refreshFileList()
+	if t.editMode && t.editor != nil {
+		t.editor.AppendExternalBlock(plain)
+	}
 }

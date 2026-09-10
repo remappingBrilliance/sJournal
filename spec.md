@@ -83,27 +83,42 @@ Every block is fully self-contained: it carries its own salt and nonce, so any s
 - Opens in Enter Mode by default.
 - Dropdown lists all `YYYY-MM-DD.md` files present in `notes/`, newest date first.
 - On load, selects/opens today's file. If today's file doesn't exist yet, it is not created until the first entry is submitted; it still appears (pending) at the top of the dropdown.
+- **Midnight roll-over:** the app does not assume it is restarted each day. When an entry is submitted (via Enter Mode or a reminder prompt) and the tab is still pointed at an earlier date because the app was left running past midnight, it automatically switches to today's file (creating it on that first entry) and the entry lands there. This is suppressed while the user has deliberately selected an older date from the dropdown — entries then keep going to that pinned date until they select today (or a new day's file) again.
 - **Timestamp checkbox:** when checked, each new entry is prefixed with `[HH:mm] ` (the time at which the user typed the first character of that entry), producing plaintext like `[HH:mm] <user text>` before encryption. The checkbox's on/off state persists across restarts as a default in `config.yaml`, but can be toggled per-session.
 - **Remind-me feature** (configured via Settings):
     - Set a start time and end time of day, and an interval.
-    - While within that window, at each interval boundary the app chimes (a short best-effort notification sound — `canberra`/`paplay` on Linux, `[console]::beep` on Windows, `afplay` on macOS; silently skipped if none is available), sends a desktop notification, and pops up a reminder. On Linux the notification is sent via `notify-send`/`gdbus` (reliable under Wayland) with a fallback to Fyne's built-in D-Bus path. If the window was minimized to the tray, the reminder restores it so the prompt is visible.
-        - The first popup requires an explicit **[OK]** dismissal before the actual "add journal entry" prompt appears — this prevents an in-progress keystroke's Enter from being swallowed as the reminder's dismissal and accidentally saving a blank entry.
-        - The user may submit an empty entry at the reminder prompt; it is discarded without writing anything to the file.
-        - If the app is in **Edit Mode** when a reminder fires, the popup instead offers **[OK]** / **[Ignore]**: OK switches to the Journal tab in Enter Mode, scrolled/positioned at the end of all current text; Ignore is a no-op.
+    - While within that window, at each interval boundary the app chimes (a short best-effort notification sound — `canberra`/`paplay` on Linux, `[console]::beep` on Windows, `afplay` on macOS; silently skipped if none is available), sends a desktop notification, and opens the reminder prompt. On Linux the notification is sent via `notify-send`/`gdbus` (reliable under Wayland) with a fallback to Fyne's built-in D-Bus path.
+        - The prompt is its **own top-level window** — a journal-entry field with **[Add]** and **[Dismiss]** — deliberately separate from the main window. The reminder never raises, focuses, or un-stashes the main window, so it can't pull the user out of whatever tab or Edit Mode session they're in; they deal with the reminder window or dismiss it and their work is untouched.
+        - Enter in the field adds the entry (Shift+Enter for a newline); **[Dismiss]**, the window's close button, or an empty **[Add]** all close it without writing anything to the file.
+        - If a reminder is still on screen when the next interval boundary arrives, that interval is skipped rather than stacking a second window.
+        - An entry added while the Journal tab happens to be in **Edit Mode** on today's file is folded into the open editor as well as appended to disk, so saving Edit Mode (a full-file rewrite) doesn't drop it.
     - The schedule (start/end/interval) is persisted in `config.yaml`, so restarting the app mid-window resumes chiming on the same schedule rather than needing to be re-armed.
 
 ## Todo Tab
 
-- Items are stored as markdown checkbox lines once decrypted: `- [ ] Item to be done` / `- [x] Done item`.
+- Items are stored as markdown checkbox lines once decrypted: `- [ ] Item to be done` / `- [x] Done item`. One item = one block.
+- **Nesting:** items can be nested (checklists only — no chaining of the checkboxes themselves; checking a parent does nothing to its children). Depth is carried on disk as leading indentation, four spaces per level:
+    ```
+    - [ ] Main
+        - [ ] Sub item
+            - [ ] Sub-sub item
+    ```
+  On load, indentation is read tolerantly (a tab = one level; other space counts round to the nearest four) and re-normalised to four-space steps on save. Maximum depth 8, and an item can't be indented more than one level past the item above it.
 - **Files:** `TODO001.md`, `TODO002.md`, ... . If none exist, the tab behaves like Notes' empty state: the dropdown shows a pending `TODO001.md`, which is only actually written to disk on the first entry.
 - Otherwise, the most-recently-modified `TODO###.md` is opened in **Enter Mode** by default. The dropdown is populated with all existing Todo files (newest first) and lets the user switch between them.
+- **Dropdown display name:** files keep their `TODO###.md` names on disk, but the dropdown shows a friendlier label when one is available — see [File dropdown display names](#file-dropdown-display-names).
 - A **[New File]** button creates the next file in numerical sequence (zero-padded to 3 digits) and switches to it.
-- **Enter Mode:** each submitted item (Enter) is encrypted as one new block appended to the current file — i.e. one checkbox item = one block. Shift+Enter is allowed within an item to add a continuation line without submitting; the resulting multi-line block is still a single checkbox item, with the `[ ]`/`[x]` marker understood to apply to the whole block (prefixing its first line).
+- **Enter Mode:** each submitted item (Enter) is encrypted as one new block appended to the current file — i.e. one checkbox item = one block. Shift+Enter is allowed within an item to add a continuation line without submitting; the resulting multi-line block is still a single checkbox item, with the `[ ]`/`[x]` marker understood to apply to the whole block (prefixing its first line). Leading whitespace (spaces, or a Tab) on the typed text nests the new item.
+    - **Heading lines:** an entry that is exactly a Markdown H1 — `# Some title` (one `#`, whitespace, text, single line) — is stored verbatim as its own block rather than being wrapped as `- [ ] # Some title`. This is how a Todo list gets a heading (and, when it's the first block, a dropdown display name). Any other text, including `## sub-headings`, becomes a normal checklist item.
 - **Edit Mode:**
-    - Shows all existing items as checkboxes with their text.
+    - Shows all existing items as checkboxes with their text, indented by depth.
+    - A heading block (`# Title`) is shown as a bold, single-line field with no checkbox; editing it down to an empty string removes it. It is written back verbatim on save (never merged into an item).
     - Checking/unchecking a box toggles that item's `[ ]`/`[x]` marker.
     - Clicking an item's text allows inline editing.
-    - Editing an item's text down to an empty string removes that item entirely.
+    - **Tab** / **Shift+Tab** with the caret at the very start of an item indents / outdents it one level (elsewhere in the line they do nothing).
+    - **Enter** at the end of an item opens a new empty item directly below it at the same depth; the trailing "New item…" row still adds a top-level item.
+    - Editing an item's text down to an empty string removes that item entirely; an empty item left at save time is dropped.
+    - A block that held several checklist lines (a legacy import) is split into one item per line; on the next save each is written as its own block.
     - Any block that fails to decrypt with the current session password (wrong password, unknown password, or corrupted data — the UI does not distinguish the cause) is shown greyed-out as "encrypted." Right-clicking it offers a one-off decrypt with a password entered for that purpose only (see [Encryption & Edit vs Enter Mode](#encryption--edit-vs-enter-mode) for what happens to it on save).
     - Exiting Edit Mode (via Save, or via the mode-switch button) re-encrypts and consolidates the file per the rules below.
 
@@ -111,8 +126,17 @@ Every block is fully self-contained: it carries its own salt and nonce, so any s
 
 - Same UI and entry/encryption behavior as Journal, but using `NOTES###.md` files (3-digit zero-padded, starting at `001`) instead of dates.
 - If no Notes files exist, the dropdown shows a pending `NOTES001.md`, written to disk on first entry (same empty-state behavior as Todo).
-- Selection dropdown and New File button work the same as Todo's.
+- Selection dropdown and New File button work the same as Todo's, including the [display-name](#file-dropdown-display-names) behavior. No special heading affordance is needed — the user just makes `# Title` the first line of the note (in Enter Mode as the first entry, or at the top of the prose box in Edit Mode).
 - No timestamp checkbox, no Remind-me feature — those are Journal-specific.
+
+## File dropdown display names
+
+- Applies to the **Todo** and **Notes** tabs only (Journal always shows its `YYYY-MM-DD.md` date).
+- Files are never renamed on disk — this is purely how the dropdown labels them.
+- For each file, the app decrypts its **first block** with the current session password and looks at that block's **first line**. If it is a Markdown H1 (`# Title`), the trimmed title text is used as the dropdown label.
+- Otherwise — the first block doesn't decrypt (old/unknown password), the file is empty/pending, or the first line isn't an H1 — the label is just the filename.
+- If two files would show the same label, the clashing ones are disambiguated by appending `  (FILENAME.md)`.
+- Labels refresh whenever the file list does (opening a file, saving Edit Mode, adding an entry); the lookup is memoised per file by modification time.
 
 # Encryption & Edit vs Enter Mode
 

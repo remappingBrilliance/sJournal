@@ -28,6 +28,11 @@ Use `build.sh`, not `go build` directly: it works around a missing
 native Wayland backend (`-tags wayland`) so the window gets a proper taskbar
 icon. Set `SJOURNAL_X11=1` to force the portable X11/XWayland build.
 
+If sJournal is already installed for your user (see below), `build.sh` also
+drops the fresh binary over `~/.local/lib/sjournal/sjournal` (atomic rename,
+so it's safe while the app is running — restart to pick it up). Set
+`SJOURNAL_NO_INSTALL=1` to skip that.
+
 Requirements: Go 1.26+, a C toolchain, and the usual Fyne build deps
 (OpenGL/X11 or Wayland + `libxkbcommon` headers). `go test ./...` runs the
 crypto and storage tests.
@@ -87,12 +92,19 @@ Everything is editable from **File → Settings…**. Only `notes_folder` and
 `single_instance` need a restart; the Settings screen says so when you change
 one. The reminder section has a **Test alert now** button.
 
+When a reminder fires it chimes, sends a desktop notification, and opens a
+small **journal-entry window of its own** — separate from the main window, so
+it never pulls you out of the tab or Edit Mode session you're in. Add the
+entry, or dismiss the window, and your work is untouched.
+
 ## Keyboard
 
 | Context | Key | Action |
 | ------- | --- | ------ |
-| Enter Mode, reminder entry popup | **Enter** | submit / add the entry |
-| Enter Mode, reminder entry popup | **Shift+Enter** | newline within the entry |
+| Enter Mode, reminder entry window | **Enter** | submit / add the entry |
+| Enter Mode, reminder entry window | **Shift+Enter** | newline within the entry |
+| Todo Edit Mode, start of an item | **Tab** / **Shift+Tab** | indent / outdent (nest) the item |
+| Todo Edit Mode, in an item | **Enter** | new item below at the same indent |
 
 ## File format
 
@@ -107,6 +119,26 @@ Blocks are self-contained and independently decryptable. A file may contain
 blocks under several passwords (e.g. after a password change); Edit Mode
 shows undecryptable blocks greyed out, with a right-click "unlock with a
 different password" option.
+
+**Naming a Todo or Notes file:** the files keep their `TODO###.md` /
+`NOTES###.md` names on disk, but if a file's first line (once decrypted) is a
+Markdown H1 — `# Weekly plan` — the dropdown shows that title instead of the
+filename. In the Todo tab, type `# Weekly plan` as an entry to lay down that
+heading (it's stored as-is, not as a checkbox item); in Notes it's just the
+first line you write.
+
+**Nested Todo items:** checklists nest as standard Markdown — four spaces of
+indent per level:
+
+```
+- [ ] Main
+    - [ ] Sub item
+        - [ ] Sub-sub item
+```
+
+In Edit Mode, Tab / Shift+Tab at the start of an item nests / un-nests it,
+and Enter opens a new item below at the same level. (Only the items nest —
+ticking a parent doesn't tick its children.)
 
 ## Layout
 

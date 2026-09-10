@@ -31,3 +31,21 @@ fi
 
 CGO_LDFLAGS="-L$LIBDIR" go build "${TAGS[@]}" -o sjournal .
 echo "Built ./sjournal"
+
+# If sJournal has been installed per-user (packaging/install-linux.sh), drop
+# the fresh binary in over the installed one so a rebuild is enough to update
+# it. Only the executable is refreshed — not the launcher, icons or config.
+# Write a temp file then rename it into place: overwriting a running
+# executable in-place fails with ETXTBSY, but an atomic rename works (the
+# running process keeps its old inode until it exits).
+if [ -z "${SJOURNAL_NO_INSTALL:-}" ]; then
+	prefix="${XDG_DATA_HOME:-$HOME/.local}"
+	prefix="${prefix%/share}"                  # accept ~/.local or ~/.local/share
+	installed="$prefix/lib/sjournal/sjournal"
+	if [ -d "$(dirname "$installed")" ]; then
+		cp sjournal "$installed.new"
+		chmod 0755 "$installed.new"
+		mv -f "$installed.new" "$installed"
+		echo "Updated $installed (restart sJournal to pick it up)"
+	fi
+fi

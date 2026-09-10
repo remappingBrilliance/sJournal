@@ -66,7 +66,7 @@ func BuildApp(app fyne.App, win fyne.Window, sess *Session) *App {
 	OnNotificationActivated = a.surface
 	a.watchRaiseSignal()
 
-	a.reminder = NewReminder(win, sess, a.journal)
+	a.reminder = NewReminder(app, sess, a.journal)
 	a.reminder.Start()
 
 	return a

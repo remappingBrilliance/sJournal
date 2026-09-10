@@ -3,7 +3,6 @@ package ui
 import (
 	"fmt"
 	"log"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +15,7 @@ import (
 // prompts for a journal entry at each interval within the configured
 // start/end window.
 type Reminder struct {
-	win     fyne.Window
+	app     fyne.App
 	sess    *Session
 	journal *FileTab
 
@@ -24,10 +23,12 @@ type Reminder struct {
 	lastFired string
 	lastState string      // dedups the diagnostic log line
 	active    atomic.Bool // a reminder prompt is on screen, unanswered
+
+	prompt *entryWindow // the reusable standalone prompt window (lazily built)
 }
 
-func NewReminder(win fyne.Window, sess *Session, journal *FileTab) *Reminder {
-	return &Reminder{win: win, sess: sess, journal: journal, stop: make(chan struct{})}
+func NewReminder(app fyne.App, sess *Session, journal *FileTab) *Reminder {
+	return &Reminder{app: app, sess: sess, journal: journal, stop: make(chan struct{})}
 }
 
 func (r *Reminder) Start() { go r.loop() }
@@ -101,74 +102,38 @@ func (r *Reminder) logState(msg string) {
 }
 
 func (r *Reminder) fire(at time.Time) {
-	// Remember whether the window was parked in the tray so we can put it
-	// back there once the reminder has been dealt with.
-	fromTray := mainWindowStashed != nil && mainWindowStashed()
-
 	Chime()
 	Alert("sJournal", "Time for a journal entry")
 
-	// Bring the window to the front so the prompt below is visible.
-	if showMainWindow != nil {
-		showMainWindow()
-	} else {
-		r.win.Show()
-		r.win.RequestFocus()
+	// The prompt is its own top-level window, deliberately separate from the
+	// main window: it must not steal the user away from whatever tab or Edit
+	// Mode session they're in, so the reminder never touches the main window
+	// (no raise, no un-stash from the tray). It is built once and reused —
+	// see entryWindow for why we never open a fresh one per fire.
+	if r.prompt == nil {
+		r.prompt = newEntryWindow(r.app)
 	}
-
-	// done tidies up after the user has finished with the reminder: clear the
-	// "prompt open" guard, withdraw the desktop notification, and if the
-	// window came from the tray, send it back.
-	done := func(returnToTray bool) {
+	r.prompt.show(at, func(text string) error {
+		return r.writeEntry(at, text)
+	}, func() {
 		r.active.Store(false)
 		DismissNotifications()
-		if returnToTray && fromTray && stashMainWindow != nil {
-			stashMainWindow()
-		}
-	}
-
-	if r.journal.editMode {
-		ShowChoice(r.win, "Journal reminder", "Journal entry time — switch to Enter Mode?",
-			[]string{"Ignore", "OK"}, func(idx int) {
-				if idx == 1 {
-					r.journal.JumpToEnd() // user wants to write — keep the window up
-					done(false)
-					return
-				}
-				done(true)
-			})
-		return
-	}
-
-	ShowChoice(r.win, "Journal reminder", "Time to add a journal entry.", []string{"OK"}, func(int) {
-		r.promptEntry(at, func() { done(true) })
 	})
 }
 
-func (r *Reminder) promptEntry(at time.Time, done func()) {
-	ShowTextEntry(r.win, "Journal entry", fmt.Sprintf("Entry for %s:", at.Format("15:04")), "Add", func(text string) {
-		// The prompt has closed — always release the guard, even if the
-		// write below fails, so reminders don't stay suppressed forever.
-		r.active.Store(false)
-
-		if strings.TrimSpace(text) == "" {
-			done()
-			return
-		}
-		plain := fmt.Sprintf("[%s] %s", at.Format("15:04"), text)
-		line, err := r.sess.Codec.Encrypt(r.sess.Password, plain)
-		if err != nil {
-			ShowError(r.win, err) // leave the window up so the error is seen
-			return
-		}
-		path := r.journal.path(store.TodayJournalName())
-		if err := store.AppendLine(path, line); err != nil {
-			ShowError(r.win, err)
-			return
-		}
-		if r.journal.currentFile == store.TodayJournalName() {
-			r.journal.refreshFileList()
-		}
-		done()
-	})
+// writeEntry encrypts and appends the reminder's journal line, then nudges
+// the Journal tab so it stays consistent with the file that was written
+// behind its back (midnight roll-over; a live Edit Mode session).
+func (r *Reminder) writeEntry(at time.Time, text string) error {
+	plain := fmt.Sprintf("[%s] %s", at.Format("15:04"), text)
+	line, err := r.sess.Codec.Encrypt(r.sess.Password, plain)
+	if err != nil {
+		return err
+	}
+	today := store.TodayJournalName()
+	if err := store.AppendLine(r.journal.path(today), line); err != nil {
+		return err
+	}
+	r.journal.AbsorbReminderEntry(plain)
+	return nil
 }

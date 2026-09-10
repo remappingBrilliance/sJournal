@@ -30,7 +30,7 @@ func ShowSettings(app fyne.App, parent fyne.Window, cfg *config.Config) {
 	interval := widget.NewEntry()
 	interval.SetText(strconv.Itoa(cfg.RemindMe.Interval))
 
-	testAlert := widget.NewButton("Test alert now", func() { testReminderAlert(parent) })
+	testAlert := widget.NewButton("Test alert now", func() { testReminderAlert(app, parent) })
 
 	// The start/end/interval fields do nothing unless "Enable Journal
 	// reminders" (below) is ticked, so grey them out until it is.
@@ -123,28 +123,30 @@ func ShowSettings(app fyne.App, parent fyne.Window, cfg *config.Config) {
 	w.Show()
 }
 
-// testReminderAlert fires the exact chime + desktop notification + popup a
-// real Journal reminder produces. It waits a few seconds first: GNOME drops
-// the banner for a notification whose app is the focused window, so a
+// previewPrompt is the reusable entry window the Settings "test alert" button
+// drives. It is separate from the real reminder's prompt (Reminder.prompt) so
+// a test fired mid-reminder can't hijack that prompt's callbacks, but like it
+// it is built once and only ever hidden/re-shown — see entryWindow.
+var previewPrompt *entryWindow
+
+// testReminderAlert fires the exact chime + desktop notification + reminder
+// window a real Journal reminder produces (its Add button is inert here — a
+// test must not write a journal entry). It waits a few seconds first: GNOME
+// drops the banner for a notification whose app is the focused window, so a
 // realistic test needs sJournal in the background.
-func testReminderAlert(win fyne.Window) {
+func testReminderAlert(app fyne.App, win fyne.Window) {
 	ShowInfo(win, "Test alert",
 		"Firing a test reminder in 5 seconds. Switch away from sJournal or send it to the tray now — GNOME only shows a reminder banner when sJournal isn't the focused window.")
 	time.AfterFunc(5*time.Second, func() {
 		fyne.Do(func() {
 			Chime()
 			Alert("sJournal", "Test alert — this is what a Journal reminder looks like.")
-			// Real reminders raise the window; mirror that here so the popup
-			// is visible even if sJournal was sent to the tray.
-			if showMainWindow != nil {
-				showMainWindow()
-			} else {
-				win.Show()
-				win.RequestFocus()
+			// The real reminder opens its own window without touching the
+			// main window; mirror that here (nil onSubmit = Add does nothing).
+			if previewPrompt == nil {
+				previewPrompt = newEntryWindow(app)
 			}
-			ShowChoice(win, "Test alert",
-				"This popup is the in-app reminder. You should also have heard a chime, and — if sJournal was in the background — seen a desktop notification banner (click it to raise the window).",
-				[]string{"OK"}, func(int) { DismissNotifications() })
+			previewPrompt.show(time.Now(), nil, func() { DismissNotifications() })
 		})
 	})
 }

@@ -264,3 +264,101 @@ func TestEncryptIndividuallyDropsRemoved(t *testing.T) {
 		t.Fatalf("got %d lines, want 1", len(lines))
 	}
 }
+
+func TestIsHeadingLine(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"# Shopping list", true},
+		{"#\tTabbed", true},
+		{"  # leading space trimmed  ", true},
+		{"# multi\nline", false},
+		{"## h2 is not h1", false},
+		{"#nospace", false},
+		{"- [ ] a task", false},
+		{"just text", false},
+		{"", false},
+		{"#", false},
+	}
+	for _, c := range cases {
+		if got := IsHeadingLine(c.in); got != c.want {
+			t.Errorf("IsHeadingLine(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIndentDepth(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"- [ ] top", 0},
+		{"  - [ ] two spaces", 1},
+		{"    - [ ] four spaces", 1},
+		{"      - [ ] six spaces", 2},
+		{"        - [ ] eight spaces", 2},
+		{"\t- [ ] one tab", 1},
+		{"\t\t- [ ] two tabs", 2},
+		{"   - [ ] three spaces (their example: a sub-item)", 1},
+		{"", 0},
+	}
+	for _, c := range cases {
+		if got := IndentDepth(c.in); got != c.want {
+			t.Errorf("IndentDepth(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestFileTitle(t *testing.T) {
+	codec := crypto.NewCodec()
+	const pw = "current"
+	const oldPW = "old"
+	dir := t.TempDir()
+
+	write := func(name string, blocks ...string) string {
+		p := filepath.Join(dir, name)
+		for _, b := range blocks {
+			line, err := codec.Encrypt(pw, b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := AppendLine(p, line); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return p
+	}
+
+	t.Run("h1 first block", func(t *testing.T) {
+		p := write("NOTES001.md", "# Groceries\n\nmilk, eggs", "- [ ] later")
+		got, ok := FileTitle(p, codec, []string{pw})
+		if !ok || got != "Groceries" {
+			t.Fatalf("got (%q, %v), want (\"Groceries\", true)", got, ok)
+		}
+	})
+
+	t.Run("no heading falls back", func(t *testing.T) {
+		p := write("NOTES002.md", "plain first line")
+		if _, ok := FileTitle(p, codec, []string{pw}); ok {
+			t.Fatal("expected ok=false for a non-heading first line")
+		}
+	})
+
+	t.Run("undecryptable first block falls back", func(t *testing.T) {
+		p := filepath.Join(dir, "NOTES003.md")
+		locked, _ := codec.Encrypt(oldPW, "# Secret heading")
+		if err := AppendLine(p, locked); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := FileTitle(p, codec, []string{pw}); ok {
+			t.Fatal("expected ok=false when the first block does not decrypt")
+		}
+	})
+
+	t.Run("empty / missing file falls back", func(t *testing.T) {
+		if _, ok := FileTitle(filepath.Join(dir, "nope.md"), codec, []string{pw}); ok {
+			t.Fatal("expected ok=false for a missing file")
+		}
+	})
+}

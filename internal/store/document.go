@@ -1,10 +1,79 @@
 package store
 
 import (
+	"regexp"
 	"strings"
 
 	"sjournal/internal/crypto"
 )
+
+// h1Re matches a single-line Markdown H1 ("# Title") — one leading '#', then
+// whitespace, then non-empty text. Used to derive a friendly dropdown name
+// for a Todo/Notes file from its first line.
+var h1Re = regexp.MustCompile(`^#[ \t]+(\S.*?)[ \t]*$`)
+
+// FileTitle returns a display title for a note file, taken from a leading
+// Markdown H1 on its first block. ok is false — meaning the caller should
+// fall back to the filename — when the file is empty, its first block does
+// not decrypt against any of passwords, or its first line is not an H1.
+func FileTitle(path string, codec *crypto.Codec, passwords []string) (title string, ok bool) {
+	lines, err := ReadLines(path)
+	if err != nil || len(lines) == 0 {
+		return "", false
+	}
+	var plain string
+	decrypted := false
+	for _, pw := range passwords {
+		if pt, err := codec.Decrypt(pw, lines[0]); err == nil {
+			plain, decrypted = pt, true
+			break
+		}
+	}
+	if !decrypted {
+		return "", false
+	}
+	first := plain
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	m := h1Re.FindStringSubmatch(first)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// IsHeadingLine reports whether s is exactly a single Markdown H1 line
+// ("# Title"), with no embedded newline. Todo Enter Mode writes such a line
+// as its own block instead of wrapping it as a checklist item, and the Todo
+// editor renders it as the list heading rather than an item.
+func IsHeadingLine(s string) bool {
+	s = strings.TrimSpace(s)
+	return !strings.ContainsRune(s, '\n') && h1Re.MatchString(s)
+}
+
+// TodoIndentUnit is the on-disk indentation of one Todo nesting level: four
+// spaces, the width Markdown needs for an unambiguous nested list.
+const TodoIndentUnit = "    "
+
+// IndentDepth is the Todo nesting depth implied by the leading whitespace of
+// s: a tab counts as one level, and every four leading spaces as one level
+// (rounded to nearest, so a hand-indented import at 2–3 or 5–6 spaces still
+// lands somewhere sensible).
+func IndentDepth(s string) int {
+	spaces := 0
+	for _, r := range s {
+		switch r {
+		case ' ':
+			spaces++
+		case '\t':
+			spaces += 4
+		default:
+			return (spaces + 2) / 4
+		}
+	}
+	return (spaces + 2) / 4
+}
 
 // Block is one line of a note file, either successfully decrypted (for Edit
 // Mode display/editing) or still opaque (shown greyed-out, unlockable via a

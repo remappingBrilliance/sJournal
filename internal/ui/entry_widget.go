@@ -21,6 +21,13 @@ type EnterModeEntry struct {
 
 	OnEnter func(text string)
 
+	// OnTab, if set, is called when Tab (shift=false) or Shift+Tab
+	// (shift=true) is pressed. Returning true consumes the key; returning
+	// false lets the embedded Entry handle it (insert a tab / do nothing).
+	// Used by the Todo editor to indent/outdent an item when the caret is at
+	// the very start of it.
+	OnTab func(shift bool) bool
+
 	shiftHeld bool
 }
 
@@ -54,6 +61,9 @@ func (e *EnterModeEntry) TypedKey(key *fyne.KeyEvent) {
 		if e.OnEnter != nil {
 			e.OnEnter(e.Text)
 		}
+		return
+	}
+	if key.Name == fyne.KeyTab && e.OnTab != nil && e.OnTab(e.shiftHeld) {
 		return
 	}
 	e.Entry.TypedKey(key)

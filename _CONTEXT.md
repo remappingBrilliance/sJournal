@@ -18,12 +18,14 @@ None — desktop app, no server, no network. Single-instance enforced via a PID-
 - `main.go` — wiring: resolve data dir (`$SJOURNAL_HOME` or exe dir) → load config → lock → build Fyne app → **register tray before `Run()`** → startup password flow → `ui.BuildApp`
 - `internal/crypto/block.go` — the encrypted block format + `KeyCache` (one Argon2id derivation per (password, salt) per process)
 - `internal/store/files.go` — notes-folder layout, file-kind regexes, line read/write
-- `internal/store/document.go` — `LoadDocument` (decrypt each line against known passwords) + block consolidation for Edit-Mode save
+- `internal/store/document.go` — `LoadDocument` (decrypt each line against known passwords) + block consolidation for Edit-Mode save; `FileTitle` (first-block "# H1" → Todo/Notes dropdown label) + `IsHeadingLine`
 - `internal/store/lock.go` — single-instance lock; `nudge_unix.go` sends SIGUSR1 to an existing instance
 - `internal/ui/app.go` — `App`: tabs, menu, quit guard, `surface`/`stashToTray` window-state, package-var hooks (`showMainWindow`, `trayQuit`, `OnNotificationActivated`)
-- `internal/ui/tab.go` — shared Journal/Todo/Notes tab (Edit vs Enter mode)
-- `internal/ui/entry_widget.go` — `EnterModeEntry`: Enter submits, Shift+Enter newlines (via `desktop.Keyable`, see Gotchas)
-- `internal/ui/reminder.go` — 20s ticker, schedule check, chime + `Alert` + prompt; `active` guard against stacked prompts
+- `internal/ui/tab.go` — shared Journal/Todo/Notes tab (Edit vs Enter mode). The Todo/Notes dropdown shows a friendly label (first-block `# H1`, via `store.FileTitle`) not the filename — `fileForDisplay`/`displayForFile` maps + `titleCache` (keyed on modtime); `currentFile` stays a filename everywhere else
+- `internal/ui/entry_widget.go` — `EnterModeEntry`: Enter submits, Shift+Enter newlines (via `desktop.Keyable`, see Gotchas); optional `OnTab(shift) bool` hook (Todo item indent/outdent)
+- `internal/ui/block_editor.go` — Edit-Mode editor. Free-text (Journal/Notes): one collapsed prose box. Todo: a `rows []*todoRow` model (item | heading/locked block); each checklist item is its own block, `depth` ⇄ 4-space indent on disk (`store.IndentDepth`/`TodoIndentUnit`, `parseTodoItems`/`formatTodoItem`). Tab/Shift+Tab at col 0 = `shiftDepth`; Enter = `openSiblingAfter` (same depth); save via `todoBlocks()` → `store.EncryptIndividually`
+- `internal/ui/reminder.go` — 20s ticker, schedule check, chime + `Alert` + prompt; `active` guard against stacked prompts (an unanswered prompt is meant to sit open for hours — it's asking what you did — and every interim interval is correctly skipped). Reminder entries written while Edit Mode is open on today's file are also folded into the live editor (`FileTab.AbsorbReminderEntry` → `BlockEditor.AppendExternalBlock`)
+- `internal/ui/entry_window.go` — `entryWindow`: the reminder's prompt as its **own top-level window**, not a modal over the main window — it never raises/focuses/un-stashes the main window. Built **once and reused** (`show()` re-populates + `Show()`s, `finish()` only `Hide()`s, never `Close()`); see the Wayland gotcha below. `Reminder.prompt` is the reminder's instance; `settings.go`'s `previewPrompt` is a separate one for the "test alert" button
 - `internal/ui/notify*.go` — `Notify`/`Alert`; Linux path is D-Bus direct (action + `ActionInvoked` listener); `notify_other.go` stubs non-Linux
 - `internal/ui/tray*.go` — `SystemTray()` (call before `Run()`); `tray_linux.go` `trayHostAvailable()` gates minimize-to-tray
 - `internal/ui/startup.go` — password prompt + last-block decrypt check (Continue/Quit/Re-enter)
@@ -39,7 +41,7 @@ None — desktop app, no server, no network. Single-instance enforced via a PID-
 startup      → startup.go RunStartup → store.MostRecentFile → crypto.Decrypt(last block) → BuildApp
 Enter submit → tab.go handleEnter → crypto.Encrypt (cached salt/key) → store.AppendLine (one block = one line)
 Edit save    → tab.go saveEditMode → BlockEditor.Lines → store consolidation → store.WriteLines (full rewrite)
-reminder     → reminder.go loop (20s) → check (window/interval/active guard) → fire → Chime + Alert + prompt → done() (dismiss notif, maybe re-stash to tray)
+reminder     → reminder.go loop (20s) → check (window/interval/active guard) → fire → Chime + Alert + entryWindow.show (reused standalone window) → onSubmit writes + AbsorbReminderEntry / onDone releases guard + dismisses notif
 ```
 
 ---
@@ -66,16 +68,23 @@ key  = Argon2id(password, salt, t=3, m=64MiB, p=4) → 32 bytes
 
 Each line is self-contained — copy a single `.md` file elsewhere and it still decrypts with the password. Multiple passwords per file are normal (password changes over time). Plaintext includes the `[HH:mm] ` prefix (if timestamping) and any embedded newlines.
 
+A Todo/Notes file's **first block** may be a lone Markdown H1 (`# Title`); if it decrypts, that title becomes the dropdown label. Todo Enter Mode stores a `# …` line as its own block (not `- [ ] …`); the Todo editor renders such a block as a heading, not a checklist item, and `EncryptIndividually` writes it back verbatim.
+
+Todo items are **one item per block** now (a legacy multi-line block is split on load; each item is re-encrypted on its own at save). Items **nest**: on disk the item line is prefixed with 4 spaces per depth level; on load `store.IndentDepth` reads it back tolerantly (tab = 1 level, other space counts round to nearest 4). No checkbox chaining — nesting is purely visual/textual, a parent's state doesn't touch children.
+
 ---
 
 ## Gotchas
 
-- **Build with `./build.sh`, never `go build`.** (a) this dev box lacks a `libXxf86vm.so` dev symlink glfw links even in the Wayland build — the script symlinks the runtime `.so.1`; (b) it adds `-tags wayland` on a Wayland session. Without that tag Fyne runs under XWayland with no usable `WM_CLASS` → GNOME/dash-to-panel can't match the window to `io.lottkowitz.sjournal.desktop` → generic icon. `SJOURNAL_X11=1` forces the portable X11 build. Vet the Wayland path with `go vet -tags wayland ./...`.
+- **Build with `./build.sh`, never `go build`.** (a) this dev box lacks a `libXxf86vm.so` dev symlink glfw links even in the Wayland build — the script symlinks the runtime `.so.1`; (b) it adds `-tags wayland` on a Wayland session. Without that tag Fyne runs under XWayland with no usable `WM_CLASS` → GNOME/dash-to-panel can't match the window to `io.lottkowitz.sjournal.desktop` → generic icon. `SJOURNAL_X11=1` forces the portable X11 build. Vet the Wayland path with `go vet -tags wayland ./...`. `build.sh` also refreshes the per-user installed binary (`~/.local/lib/sjournal/sjournal`) if that dir exists, via temp-file + atomic rename (in-place overwrite of a running exe is ETXTBSY); `SJOURNAL_NO_INSTALL=1` skips that. Restart the app to pick up the new binary.
 - **`win.SetIcon()` does nothing on Wayland.** Taskbar icon = window `app_id` (`io.lottkowitz.sjournal`, set by the `-tags wayland` build) → installed `.desktop` basename → `Icon=`. Needs `install-linux.sh` to have run.
+- **Never `Close()` a focused top-level window on Wayland during normal operation.** GLFW's Wayland backend races window destruction against compositor input delivery: the next `glfwPollEvents()` dispatches a queued key event to the torn-down surface → `_glfwInputKey: Assertion 'window != NULL'` → `abort()` (SIGABRT, "signal arrived during cgo execution"). The reminder used to open+close a fresh prompt window every fire; now `entryWindow` is built once and only `Show()`/`Hide()`d (`Hide()` deferred one loop turn — hiding a surface from inside its own key event is silently dropped, cf. `App.stashToTray`). Only teardown (`app.Quit()`) closes it.
 - **`SetSystemTrayMenu` must be called before `fyne.App.Run()`** — the glfw driver starts the tray subsystem once at the top of its loop. Hence `ui.SystemTray()` is in `main()`, not `BuildApp()`.
 - **GNOME hides notification banners from the focused app.** Reminders therefore use `Alert()` = critical urgency so the banner shows regardless. `Notify()` (normal) is only for the tray hint.
 - **GNOME has no built-in tray.** `trayHostAvailable()` checks `IsStatusNotifierHostRegistered`; if false, `minimize_to_tray` falls back to a plain quit. Needs the AppIndicator / "Tray Icons" shell extension.
 - **Fyne never synthesizes a `CustomShortcut` for a bare Shift modifier** (`internal/driver/glfw/window.go` `triggersShortcut`). Shift+Enter is detected by implementing `desktop.Keyable` and tracking Shift up/down manually — see `entry_widget.go`. `canvas.AddShortcut(Shift+…)` compiles but silently never fires.
+- **Focusing a just-created widget:** `deferFocus` polls `Driver().CanvasForObject(obj)` which needs a paint pass — fine for a widget that already existed, flaky for a brand-new one (no repaint may be pending). `win.Canvas().Focus(f)` instead walks the *live* widget tree (`FocusManager.Focus`), so a widget added to a container this same tick is reachable immediately — it only needs the *container/editor* to be on a canvas. `BlockEditor.focusItem` uses that (Enter → new Todo item lands focused).
+- **Journal tab rolls over at midnight.** `handleEnter` (and `reminder.go`'s `promptEntry`) re-targets `store.TodayJournalName()` if the tab drifted onto an earlier date from being left running overnight — unless `journalPinned` is set (user picked an older date from the dropdown; cleared again when they select today).
 - **`notes_folder` and `single_instance` take effect only on restart** (read once at startup — `NotesDir` is copied into `Session`, lock is acquired in `main`). Everything else in `config.yaml` is live. The Settings screen only shows the restart warning when one of those two changed.
 - **`config.yaml` lives next to the executable** (or in `$SJOURNAL_HOME`), *not* inside `notes/`, so settings survive relocating the notes folder.
 - **No password recovery.** A forgotten password = those blocks are permanently unreadable. This is the security guarantee, not a bug.

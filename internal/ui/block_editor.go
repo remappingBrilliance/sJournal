@@ -2,10 +2,12 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"regexp"
 	"strings"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 
@@ -13,7 +15,15 @@ import (
 	"sjournal/internal/store"
 )
 
+// todoLineRe matches a checklist line once its leading indentation has been
+// stripped (the indent is read separately, via store.IndentDepth).
 var todoLineRe = regexp.MustCompile(`^- \[([ xX])\] (.*)$`)
+
+// todoMaxDepth caps how far a checklist item can be nested.
+const todoMaxDepth = 8
+
+// todoIndentPx is the on-screen width of one nesting level in Edit Mode.
+const todoIndentPx = 24
 
 // lockedBlock is a small widget for a still-encrypted block: shown greyed
 // out, right-click offers a one-off password to unlock it for this Edit
@@ -46,50 +56,64 @@ func (l *lockedBlock) TappedSecondary(*fyne.PointEvent) {
 	}
 }
 
-// todoItem is one checklist line parsed out of a decrypted block's
-// markdown. Several items can share one underlying block (chunk) — e.g. a
-// chunk that already held multiple items before this editor ever loaded
-// it — in which case editing any one of them re-serializes all of that
-// chunk's surviving items back into it as a group; new items typed into
-// the trailing blank row each get their own fresh chunk.
+// todoItem is one checklist item — its own block on disk. depth is its
+// nesting level (0 = top). text may carry embedded newlines from Shift+Enter
+// continuation lines; the "[ ]"/"[x]" marker applies to the whole item.
 type todoItem struct {
-	blockIdx int
-	checked  bool
-	text     string
-	removed  bool
-}
-
-// parseTodoLines splits a block's decrypted plaintext into checklist items.
-// A line matching "- [ ] "/"- [x] " starts a new item; any line that
-// doesn't (e.g. a Shift+Enter continuation line, or legacy freeform text)
-// is appended to the current item so multi-line items and non-conforming
-// content both round-trip instead of being silently dropped.
-func parseTodoLines(plaintext string) []struct {
+	depth   int
 	checked bool
 	text    string
-} {
-	var items []struct {
-		checked bool
-		text    string
-	}
+}
+
+// todoRow is one visible row of the Todo editor: exactly one of item (a
+// checklist item) or block (a heading block, or a still-encrypted block
+// shown greyed-out) is set.
+type todoRow struct {
+	item  *todoItem
+	block *store.Block
+}
+
+// parseTodoItems splits a decrypted block's plaintext into checklist items,
+// reading each item's nesting depth from its leading indentation. A line
+// that isn't a "- [ ] "/"- [x] " line (a Shift+Enter continuation, or
+// legacy freeform text) is appended to the current item so multi-line items
+// and non-conforming content both round-trip instead of being dropped.
+func parseTodoItems(plaintext string) []*todoItem {
+	var items []*todoItem
 	for _, line := range strings.Split(plaintext, "\n") {
-		if m := todoLineRe.FindStringSubmatch(line); m != nil {
-			items = append(items, struct {
-				checked bool
-				text    string
-			}{checked: strings.EqualFold(m[1], "x"), text: m[2]})
+		body := strings.TrimLeft(line, " \t")
+		if m := todoLineRe.FindStringSubmatch(body); m != nil {
+			items = append(items, &todoItem{
+				depth:   min(store.IndentDepth(line), todoMaxDepth),
+				checked: strings.EqualFold(m[1], "x"),
+				text:    m[2],
+			})
 			continue
 		}
 		if len(items) == 0 {
-			items = append(items, struct {
-				checked bool
-				text    string
-			}{checked: false, text: line})
+			items = append(items, &todoItem{depth: min(store.IndentDepth(line), todoMaxDepth), text: body})
 			continue
 		}
-		items[len(items)-1].text += "\n" + line
+		items[len(items)-1].text += "\n" + body
 	}
 	return items
+}
+
+// formatTodoItem renders an item back to its on-disk line(s): the indent for
+// its depth, the "- [x] " marker, then the text (continuation lines indented
+// to sit under the marker).
+func formatTodoItem(it *todoItem) string {
+	mark := " "
+	if it.checked {
+		mark = "x"
+	}
+	indent := strings.Repeat(store.TodoIndentUnit, it.depth)
+	lines := strings.Split(it.text, "\n")
+	lines[0] = fmt.Sprintf("%s- [%s] %s", indent, mark, lines[0])
+	for i := 1; i < len(lines); i++ {
+		lines[i] = indent + "  " + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // BlockEditor renders a file's blocks for Edit Mode.
@@ -100,42 +124,42 @@ func parseTodoLines(plaintext string) []struct {
 // and edits as continuous prose rather than a stack of separate boxes, and
 // that area fills the whole Edit Mode panel.
 //
-// In Todo mode, each block's decrypted markdown is parsed into one row per
-// checklist item (a block may hold more than one), plus one always-present
-// blank row at the end for adding a new item. Enter in any row commits it
-// and moves focus to the next row; Enter in the trailing blank row (with
-// text) turns it into a new item — its own new chunk — and a fresh blank
-// row appears below it. Saving re-encrypts each chunk on its own (see
-// store.EncryptIndividually) rather than merging them, so items stay
-// independently editable/decryptable across sessions.
+// In Todo mode, each checklist item is its own block. A decrypted block that
+// holds several "- [ ] " lines is split into one item each on load, so items
+// are independently editable and every save writes one item per block (see
+// store.EncryptIndividually — no chunk merging). Items nest: leading
+// indentation on disk ⇄ a depth per item. Tab / Shift+Tab at the start of an
+// item indents / outdents it; Enter at the end of an item opens a new
+// sibling below at the same depth. A lone "# Title" block is shown as the
+// list heading, not an item. Still-encrypted blocks stay greyed-out in place.
 type BlockEditor struct {
 	widget.BaseWidget
 
 	win      fyne.Window
-	blocks   []*store.Block
+	blocks   []*store.Block // free-text mode only
 	todoMode bool
 	codec    *crypto.Codec
 	box      *fyne.Container
 	onChange func()
 
-	// items and rowEntries are Todo-mode-only, rebuilt fresh from blocks
-	// every rebuild(). rowEntries holds the row entries in visual order
-	// (including the trailing blank row), used to move focus to "the next
-	// row" on Enter.
-	items      []*todoItem
-	rowEntries []*EnterModeEntry
+	// Todo-mode only: rows is the ordered visible model; itemEntry maps each
+	// live item to its entry widget so focus can be restored after a rebuild;
+	// newItemEntry is the trailing "New item…" field.
+	rows         []*todoRow
+	itemEntry    map[*todoItem]*EnterModeEntry
+	newItemEntry *EnterModeEntry
 }
 
 func NewBlockEditor(win fyne.Window, blocks []*store.Block, todoMode bool, codec *crypto.Codec, onChange func()) *BlockEditor {
 	e := &BlockEditor{
 		win:      win,
-		blocks:   blocks,
 		todoMode: todoMode,
 		codec:    codec,
 		onChange: onChange,
 	}
 	if todoMode {
 		e.box = container.NewVBox()
+		e.rows = buildTodoRows(blocks)
 	} else {
 		e.blocks = collapseDecryptedRuns(blocks)
 		// NewStack (unlike VBox) stretches its content to fill all
@@ -145,6 +169,26 @@ func NewBlockEditor(win fyne.Window, blocks []*store.Block, todoMode bool, codec
 	e.ExtendBaseWidget(e)
 	e.rebuild()
 	return e
+}
+
+// buildTodoRows expands a file's blocks into the editor's row model: heading
+// and still-encrypted blocks pass through as-is; every other decrypted block
+// is split into one row per checklist item.
+func buildTodoRows(blocks []*store.Block) []*todoRow {
+	var rows []*todoRow
+	for _, b := range blocks {
+		if b.Removed {
+			continue
+		}
+		if !b.Decrypted || store.IsHeadingLine(b.Plaintext) {
+			rows = append(rows, &todoRow{block: b})
+			continue
+		}
+		for _, it := range parseTodoItems(b.Plaintext) {
+			rows = append(rows, &todoRow{item: it})
+		}
+	}
+	return rows
 }
 
 // collapseDecryptedRuns merges consecutive decrypted blocks into a single
@@ -182,6 +226,33 @@ func collapseDecryptedRuns(blocks []*store.Block) []*store.Block {
 	}
 	flush()
 	return out
+}
+
+// AppendExternalBlock folds a line written to the file outside this editor
+// (a reminder window's entry, while Edit Mode was open on the same file)
+// into the in-memory model, so saving Edit Mode — a full-file rewrite —
+// doesn't drop it. Free-text (Journal/Notes) only — the reminder never
+// writes to a Todo file. It extends the last decrypted run so the file still
+// reads as one block; in-progress edits to existing blocks are preserved
+// (OnChanged mirrors them synchronously), though the rebuild moves focus.
+func (e *BlockEditor) AppendExternalBlock(plaintext string) {
+	for i := len(e.blocks) - 1; i >= 0; i-- {
+		b := e.blocks[i]
+		if b.Removed || !b.Decrypted {
+			continue
+		}
+		if b.Plaintext == "" {
+			b.Plaintext = plaintext
+		} else {
+			b.Plaintext += "\n" + plaintext
+		}
+		e.rebuild()
+		e.changed()
+		return
+	}
+	e.blocks = append(e.blocks, &store.Block{Plaintext: plaintext, Decrypted: true})
+	e.rebuild()
+	e.changed()
 }
 
 func (e *BlockEditor) changed() {
@@ -252,27 +323,44 @@ func (e *BlockEditor) freeTextRow(b *store.Block) fyne.CanvasObject {
 }
 
 func (e *BlockEditor) rebuildTodo() {
-	e.items = nil
-	e.rowEntries = nil
+	e.normalizeTodoRows()
+	e.itemEntry = map[*todoItem]*EnterModeEntry{}
 	e.box.Objects = nil
 
-	for bi, b := range e.blocks {
-		if b.Removed {
-			continue
-		}
-		if !b.Decrypted {
-			b := b
+	for _, r := range e.rows {
+		switch {
+		case r.item != nil:
+			e.box.Add(e.todoItemRow(r.item))
+		case !r.block.Decrypted:
+			b := r.block
 			e.box.Add(newLockedBlock(func() { e.promptUnlock(b) }))
-			continue
-		}
-		for _, line := range parseTodoLines(b.Plaintext) {
-			item := &todoItem{blockIdx: bi, checked: line.checked, text: line.text}
-			e.items = append(e.items, item)
-			e.box.Add(e.todoItemRow(item))
+		default:
+			e.box.Add(e.headingRow(r.block))
 		}
 	}
 	e.box.Add(e.newItemRow())
 	e.box.Refresh()
+}
+
+// normalizeTodoRows re-expands any row whose block became a decrypted,
+// non-heading block since the last rebuild (a locked block the user just
+// unlocked) into its checklist items.
+func (e *BlockEditor) normalizeTodoRows() {
+	var out []*todoRow
+	for _, r := range e.rows {
+		if r.item == nil && r.block != nil && r.block.Decrypted &&
+			!r.block.Removed && !store.IsHeadingLine(r.block.Plaintext) {
+			for _, it := range parseTodoItems(r.block.Plaintext) {
+				out = append(out, &todoRow{item: it})
+			}
+			continue
+		}
+		if r.block != nil && r.block.Removed {
+			continue
+		}
+		out = append(out, r)
+	}
+	e.rows = out
 }
 
 // todoRowLines returns how many rows a todo item's entry should reserve —
@@ -284,10 +372,8 @@ func todoRowLines(text string) int {
 }
 
 func (e *BlockEditor) todoItemRow(item *todoItem) fyne.CanvasObject {
-	rowIndex := len(e.rowEntries)
-
 	var entry *EnterModeEntry
-	entry = NewEnterModeEntry(func(string) { e.advanceFocus(rowIndex) })
+	entry = NewEnterModeEntry(func(string) { e.openSiblingAfter(item) })
 	// Word-wrap forces Entry to wrap itself in an internal scroll container
 	// (see widget/entry.go) that swallows mouse-wheel events even when
 	// there's nothing to scroll, which is what was blocking the outer Todo
@@ -296,6 +382,14 @@ func (e *BlockEditor) todoItemRow(item *todoItem) fyne.CanvasObject {
 	entry.Wrapping = fyne.TextWrapOff
 	entry.SetText(item.text)
 	entry.SetMinRowsVisible(todoRowLines(item.text))
+	// Tab / Shift+Tab at the very start of the item nests / un-nests it;
+	// elsewhere it's swallowed (a literal tab in an item helps nobody).
+	entry.OnTab = func(shift bool) bool {
+		if entry.CursorRow == 0 && entry.CursorColumn == 0 {
+			e.shiftDepth(item, shift)
+		}
+		return true
+	}
 
 	check := widget.NewCheck("", nil)
 	check.SetChecked(item.checked)
@@ -306,65 +400,170 @@ func (e *BlockEditor) todoItemRow(item *todoItem) fyne.CanvasObject {
 		entry.SetMinRowsVisible(todoRowLines(entry.Text))
 		e.box.Refresh()
 		if strings.TrimSpace(item.text) == "" {
-			item.removed = true
-			e.syncBlock(item.blockIdx)
-			e.rebuild()
+			e.removeItem(item)
 			e.changed()
 			return
 		}
-		e.syncBlock(item.blockIdx)
 		e.changed()
 	}
 	check.OnChanged = func(bool) { sync() }
 	entry.OnChanged = func(string) { sync() }
 
-	e.rowEntries = append(e.rowEntries, entry)
-	return container.NewBorder(nil, nil, check, nil, entry)
+	e.itemEntry[item] = entry
+
+	indent := canvas.NewRectangle(color.Transparent)
+	indent.SetMinSize(fyne.NewSize(float32(item.depth)*todoIndentPx, 1))
+	return container.NewBorder(nil, nil, container.NewHBox(indent, check), nil, entry)
 }
 
-// syncBlock re-serializes every surviving item belonging to blockIdx back
-// into that block's Plaintext (preserving multi-item chunks as a group),
-// or marks the block Removed if none survive.
-func (e *BlockEditor) syncBlock(blockIdx int) {
-	var lines []string
-	for _, it := range e.items {
-		if it.blockIdx != blockIdx || it.removed {
-			continue
+// rowIndexOfItem returns item's position in e.rows, or -1.
+func (e *BlockEditor) rowIndexOfItem(item *todoItem) int {
+	for i, r := range e.rows {
+		if r.item == item {
+			return i
 		}
-		mark := " "
-		if it.checked {
-			mark = "x"
-		}
-		lines = append(lines, fmt.Sprintf("- [%s] %s", mark, it.text))
 	}
-	if len(lines) == 0 {
-		e.blocks[blockIdx].Removed = true
+	return -1
+}
+
+// shiftDepth indents (shift=false) or outdents (shift=true) item by one
+// level, clamped to [0, one deeper than the row above], and keeps focus on it.
+func (e *BlockEditor) shiftDepth(item *todoItem, outdent bool) {
+	old := item.depth
+	if outdent {
+		if item.depth > 0 {
+			item.depth--
+		}
+	} else if item.depth < e.maxDepthFor(item) {
+		item.depth++
+	}
+	if item.depth == old {
 		return
 	}
-	e.blocks[blockIdx].Plaintext = strings.Join(lines, "\n")
+	e.changed()
+	e.rebuild()
+	e.focusItem(item)
+}
+
+// focusItem moves focus to item's entry. Unlike deferFocus it doesn't wait
+// for a paint pass: the focus manager walks the live widget tree, so an
+// entry added to e.box this same tick is already reachable. It only needs
+// the editor itself to be on a canvas — which isn't true during the very
+// first build (before the window's SetContent), so fall back to deferFocus
+// then.
+func (e *BlockEditor) focusItem(item *todoItem) {
+	entry := e.itemEntry[item]
+	if entry == nil {
+		return
+	}
+	if fyne.CurrentApp().Driver().CanvasForObject(e) == nil {
+		deferFocus(e.win, entry)
+		return
+	}
+	e.win.Canvas().Focus(entry)
+}
+
+// maxDepthFor is how deep item is allowed to nest: one past the nearest
+// item row above it (so a list can't sprout an orphan indent), and never
+// past todoMaxDepth.
+func (e *BlockEditor) maxDepthFor(item *todoItem) int {
+	limit := 0
+	idx := e.rowIndexOfItem(item)
+	for i := idx - 1; i >= 0; i-- {
+		if prev := e.rows[i].item; prev != nil {
+			limit = prev.depth + 1
+			break
+		}
+	}
+	return min(limit, todoMaxDepth)
+}
+
+// openSiblingAfter inserts a fresh empty item just below item at the same
+// depth and moves focus to it — Enter at the end of a checklist line.
+func (e *BlockEditor) openSiblingAfter(item *todoItem) {
+	if strings.TrimSpace(item.text) == "" {
+		return // don't spawn empties off an empty row
+	}
+	idx := e.rowIndexOfItem(item)
+	if idx < 0 {
+		return
+	}
+	ni := &todoItem{depth: item.depth}
+	rows := make([]*todoRow, 0, len(e.rows)+1)
+	rows = append(rows, e.rows[:idx+1]...)
+	rows = append(rows, &todoRow{item: ni})
+	rows = append(rows, e.rows[idx+1:]...)
+	e.rows = rows
+	e.changed()
+	e.rebuild()
+	e.focusItem(ni)
+}
+
+// removeItem drops item's row and focuses the nearest item row above it.
+func (e *BlockEditor) removeItem(item *todoItem) {
+	idx := e.rowIndexOfItem(item)
+	if idx < 0 {
+		return
+	}
+	e.rows = append(e.rows[:idx], e.rows[idx+1:]...)
+	delete(e.itemEntry, item)
+	e.rebuild()
+	for i := idx - 1; i >= 0; i-- {
+		if prev := e.rows[i].item; prev != nil {
+			e.focusItem(prev)
+			return
+		}
+	}
+}
+
+// headingRow renders a Todo file's heading block ("# Title") as a bold,
+// single-line editable field with no checkbox. Clearing it drops the block.
+func (e *BlockEditor) headingRow(b *store.Block) fyne.CanvasObject {
+	entry := NewEnterModeEntry(nil)
+	entry.Wrapping = fyne.TextWrapOff
+	entry.TextStyle = fyne.TextStyle{Bold: true}
+	entry.SetText(b.Plaintext)
+	entry.SetMinRowsVisible(1)
+	entry.OnChanged = func(text string) {
+		b.Plaintext = text
+		if strings.TrimSpace(text) == "" {
+			b.Removed = true
+			e.rebuild()
+		}
+		e.changed()
+	}
+	return entry
 }
 
 // newItemRow is the always-present blank row at the bottom of a Todo list.
-// Typing text and pressing Enter here turns it into a real new item (its
-// own new chunk) and a fresh blank row takes its place.
+// Enter here adds a new top-level item (or, for "# Title", a heading);
+// leading whitespace nests it, and a fresh blank row takes its place.
 func (e *BlockEditor) newItemRow() fyne.CanvasObject {
 	entry := NewEnterModeEntry(func(text string) {
 		if strings.TrimSpace(text) == "" {
 			return
 		}
-		e.blocks = append(e.blocks, &store.Block{
-			Plaintext: fmt.Sprintf("- [ ] %s", text),
-			Decrypted: true,
-		})
+		var r *todoRow
+		if store.IsHeadingLine(text) {
+			r = &todoRow{block: &store.Block{Plaintext: strings.TrimSpace(text), Decrypted: true}}
+		} else {
+			r = &todoRow{item: &todoItem{
+				depth: min(store.IndentDepth(text), todoMaxDepth),
+				text:  strings.TrimLeft(text, " \t"),
+			}}
+		}
+		e.rows = append(e.rows, r)
 		e.changed()
 		e.rebuild()
-		if len(e.rowEntries) > 0 {
-			deferFocus(e.win, e.rowEntries[len(e.rowEntries)-1])
+		// Keep focus on this box so items can be added one after another.
+		if e.newItemEntry != nil && fyne.CurrentApp().Driver().CanvasForObject(e) != nil {
+			e.win.Canvas().Focus(e.newItemEntry)
 		}
 	})
 	entry.Wrapping = fyne.TextWrapOff
-	entry.SetPlaceHolder("New item…")
+	entry.SetPlaceHolder("New item… (or “# Heading”)")
 	entry.SetMinRowsVisible(1)
+	e.newItemEntry = entry
 	entry.OnChanged = func(t string) {
 		entry.SetMinRowsVisible(todoRowLines(t))
 		e.box.Refresh()
@@ -373,17 +572,7 @@ func (e *BlockEditor) newItemRow() fyne.CanvasObject {
 	check := widget.NewCheck("", nil)
 	check.Disable()
 
-	e.rowEntries = append(e.rowEntries, entry)
 	return container.NewBorder(nil, nil, check, nil, entry)
-}
-
-// advanceFocus moves focus to the row after rowIndex (the next item, or the
-// trailing blank "new item" row), if any.
-func (e *BlockEditor) advanceFocus(rowIndex int) {
-	next := rowIndex + 1
-	if next < len(e.rowEntries) {
-		safeFocus(e.win, e.rowEntries[next])
-	}
 }
 
 func (e *BlockEditor) promptUnlock(b *store.Block) {
@@ -398,12 +587,43 @@ func (e *BlockEditor) promptUnlock(b *store.Block) {
 }
 
 // Lines returns the on-disk block lines for this editor's current state,
-// ready to write with store.WriteLines. Todo mode never merges chunks
-// together (see store.EncryptIndividually); free-text mode consolidates as
-// usual.
+// ready to write with store.WriteLines. Todo mode writes one block per
+// checklist item / heading (see store.EncryptIndividually — no merging);
+// free-text mode consolidates as usual.
 func (e *BlockEditor) Lines(sessionPassword string) ([]string, error) {
 	if e.todoMode {
-		return store.EncryptIndividually(e.blocks, sessionPassword, e.codec)
+		return store.EncryptIndividually(e.todoBlocks(), sessionPassword, e.codec)
 	}
 	return store.Consolidate(e.blocks, sessionPassword, e.codec)
+}
+
+// todoBlocks flattens the row model back to blocks for saving: one block per
+// non-empty item (indented "- [x] " line), heading blocks and still-locked
+// blocks passed through unchanged.
+func (e *BlockEditor) todoBlocks() []*store.Block {
+	var bs []*store.Block
+	for _, r := range e.rows {
+		if r.item != nil {
+			if strings.TrimSpace(r.item.text) == "" {
+				continue
+			}
+			bs = append(bs, &store.Block{Plaintext: formatTodoItem(r.item), Decrypted: true})
+			continue
+		}
+		if r.block != nil && !r.block.Removed {
+			bs = append(bs, r.block)
+		}
+	}
+	return bs
+}
+
+// todoItems returns the current checklist items in order (test/debug helper).
+func (e *BlockEditor) todoItems() []*todoItem {
+	var items []*todoItem
+	for _, r := range e.rows {
+		if r.item != nil {
+			items = append(items, r.item)
+		}
+	}
+	return items
 }
