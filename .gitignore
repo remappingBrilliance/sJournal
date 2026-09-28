@@ -4,3 +4,7 @@
 /notes/
 /config.yaml
 /packaging/dist/
+
+# VSCode SFTP extension workspace config - commonly holds a live host
+# password/credentials in plaintext, never commit
+.sftp.json

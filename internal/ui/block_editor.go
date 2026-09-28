@@ -5,10 +5,12 @@ import (
 	"image/color"
 	"regexp"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 
 	"sjournal/internal/crypto"
@@ -18,6 +20,20 @@ import (
 // todoLineRe matches a checklist line once its leading indentation has been
 // stripped (the indent is read separately, via store.IndentDepth).
 var todoLineRe = regexp.MustCompile(`^- \[([ xX])\] (.*)$`)
+
+// completedDateRe matches the trailing "<!-- c:YYYY-MM-DD -->" marker Edit
+// Mode appends to a checked item's on-disk text so the completion date
+// round-trips without cluttering the editable text itself.
+var completedDateRe = regexp.MustCompile(`[ \t]+<!--[ \t]*c:(\d{4}-\d{2}-\d{2})[ \t]*-->[ \t]*$`)
+
+// splitCompletedDate strips a trailing completed-date marker from text,
+// returning the cleaned text and the date (empty if there was no marker).
+func splitCompletedDate(text string) (string, string) {
+	if m := completedDateRe.FindStringSubmatch(text); m != nil {
+		return text[:len(text)-len(m[0])], m[1]
+	}
+	return text, ""
+}
 
 // todoMaxDepth caps how far a checklist item can be nested.
 const todoMaxDepth = 8
@@ -59,10 +75,14 @@ func (l *lockedBlock) TappedSecondary(*fyne.PointEvent) {
 // todoItem is one checklist item — its own block on disk. depth is its
 // nesting level (0 = top). text may carry embedded newlines from Shift+Enter
 // continuation lines; the "[ ]"/"[x]" marker applies to the whole item.
+// completedDate (YYYY-MM-DD, store.JournalDateLayout) is set the moment the
+// item is checked and cleared the moment it's unchecked; it round-trips as a
+// trailing "<!-- c:... -->" marker on the item's on-disk line.
 type todoItem struct {
-	depth   int
-	checked bool
-	text    string
+	depth         int
+	checked       bool
+	text          string
+	completedDate string
 }
 
 // todoRow is one visible row of the Todo editor: exactly one of item (a
@@ -96,6 +116,9 @@ func parseTodoItems(plaintext string) []*todoItem {
 		}
 		items[len(items)-1].text += "\n" + body
 	}
+	for _, it := range items {
+		it.text, it.completedDate = splitCompletedDate(it.text)
+	}
 	return items
 }
 
@@ -113,7 +136,11 @@ func formatTodoItem(it *todoItem) string {
 	for i := 1; i < len(lines); i++ {
 		lines[i] = indent + "  " + lines[i]
 	}
-	return strings.Join(lines, "\n")
+	out := strings.Join(lines, "\n")
+	if it.checked && it.completedDate != "" {
+		out += fmt.Sprintf(" <!-- c:%s -->", it.completedDate)
+	}
+	return out
 }
 
 // BlockEditor renders a file's blocks for Edit Mode.
@@ -144,10 +171,18 @@ type BlockEditor struct {
 
 	// Todo-mode only: rows is the ordered visible model; itemEntry maps each
 	// live item to its entry widget so focus can be restored after a rebuild;
-	// newItemEntry is the trailing "New item…" field.
-	rows         []*todoRow
-	itemEntry    map[*todoItem]*EnterModeEntry
-	newItemEntry *EnterModeEntry
+	// newItemEntry is the trailing "New item…" field; newItemDepth is that
+	// field's pending nesting level (Tab/Shift+Tab before the item exists).
+	// hideCompleted/hideCompletedCheck back the "Hide completed" toggle above
+	// the list — checked items stay in rows (and are still saved) either way,
+	// this only affects what rebuildTodo renders.
+	rows               []*todoRow
+	itemEntry          map[*todoItem]*EnterModeEntry
+	itemCheck          map[*todoItem]*widget.Check
+	newItemEntry       *EnterModeEntry
+	newItemDepth       int
+	hideCompleted      bool
+	hideCompletedCheck *widget.Check
 }
 
 func NewBlockEditor(win fyne.Window, blocks []*store.Block, todoMode bool, codec *crypto.Codec, onChange func()) *BlockEditor {
@@ -160,6 +195,10 @@ func NewBlockEditor(win fyne.Window, blocks []*store.Block, todoMode bool, codec
 	if todoMode {
 		e.box = container.NewVBox()
 		e.rows = buildTodoRows(blocks)
+		e.hideCompletedCheck = widget.NewCheck("Hide completed", func(checked bool) {
+			e.hideCompleted = checked
+			e.rebuildTodo()
+		})
 	} else {
 		e.blocks = collapseDecryptedRuns(blocks)
 		// NewStack (unlike VBox) stretches its content to fill all
@@ -263,7 +302,8 @@ func (e *BlockEditor) changed() {
 
 func (e *BlockEditor) CreateRenderer() fyne.WidgetRenderer {
 	if e.todoMode {
-		return widget.NewSimpleRenderer(container.NewVScroll(e.box))
+		return widget.NewSimpleRenderer(container.NewBorder(
+			e.hideCompletedCheck, nil, nil, nil, container.NewVScroll(e.box)))
 	}
 	return widget.NewSimpleRenderer(e.box)
 }
@@ -325,11 +365,15 @@ func (e *BlockEditor) freeTextRow(b *store.Block) fyne.CanvasObject {
 func (e *BlockEditor) rebuildTodo() {
 	e.normalizeTodoRows()
 	e.itemEntry = map[*todoItem]*EnterModeEntry{}
+	e.itemCheck = map[*todoItem]*widget.Check{}
 	e.box.Objects = nil
 
 	for _, r := range e.rows {
 		switch {
 		case r.item != nil:
+			if e.hideCompleted && r.item.checked {
+				continue
+			}
 			e.box.Add(e.todoItemRow(r.item))
 		case !r.block.Decrypted:
 			b := r.block
@@ -394,8 +438,25 @@ func (e *BlockEditor) todoItemRow(item *todoItem) fyne.CanvasObject {
 	check := widget.NewCheck("", nil)
 	check.SetChecked(item.checked)
 
-	sync := func() {
-		item.checked = check.Checked
+	// Checking/unchecking stamps or clears the completion date; it never
+	// needs to touch item.text, so it's kept separate from the entry's
+	// OnChanged (below) which fires on every keystroke and must not rebuild.
+	// A full rebuild (rather than box.Refresh()) is needed either way: the
+	// completed-date tag beside the entry only exists on checked rows, so it
+	// has to be added/removed, not just repainted.
+	check.OnChanged = func(checked bool) {
+		item.checked = checked
+		if checked {
+			if item.completedDate == "" {
+				item.completedDate = time.Now().Format(store.JournalDateLayout)
+			}
+		} else {
+			item.completedDate = ""
+		}
+		e.changed()
+		e.rebuildTodo()
+	}
+	entry.OnChanged = func(string) {
 		item.text = entry.Text
 		entry.SetMinRowsVisible(todoRowLines(entry.Text))
 		e.box.Refresh()
@@ -406,14 +467,72 @@ func (e *BlockEditor) todoItemRow(item *todoItem) fyne.CanvasObject {
 		}
 		e.changed()
 	}
-	check.OnChanged = func(bool) { sync() }
-	entry.OnChanged = func(string) { sync() }
 
 	e.itemEntry[item] = entry
+	e.itemCheck[item] = check
 
 	indent := canvas.NewRectangle(color.Transparent)
 	indent.SetMinSize(fyne.NewSize(float32(item.depth)*todoIndentPx, 1))
-	return container.NewBorder(nil, nil, container.NewHBox(indent, check), nil, entry)
+
+	var tag fyne.CanvasObject
+	if item.checked && item.completedDate != "" {
+		tag = e.completedDateTag(item.completedDate)
+	}
+	return container.NewBorder(nil, nil, container.NewHBox(indent, check), tag, entry)
+}
+
+// completedDateTag is the small grey "completed on" marker shown to the
+// right of a checked item's entry. It's always visible (unlike a
+// hover-only hint, which turned out to be unreliable — widget.Check already
+// implements desktop.Hoverable for its own hover highlight, and the hit-test
+// walk lets the deepest matching object win, so a hoverTooltip wrapped
+// around the checkbox itself never received the mouse events). Hovering the
+// tag itself — a plain widget.Label, which isn't Hoverable — still shows the
+// same date in a small popup.
+func (e *BlockEditor) completedDateTag(date string) fyne.CanvasObject {
+	label := widget.NewLabel(date)
+	label.Importance = widget.LowImportance
+	return newHoverTooltip(e.win, label, func() string { return "Completed " + date })
+}
+
+// hoverTooltip wraps a CanvasObject and, while the pointer is over it, shows
+// a small popup with whatever textFunc currently returns (nothing is shown
+// when it returns ""). Used to surface a Todo item's completion date without
+// giving it a permanently-visible label.
+type hoverTooltip struct {
+	widget.BaseWidget
+	content  fyne.CanvasObject
+	textFunc func() string
+	win      fyne.Window
+	popup    *widget.PopUp
+}
+
+func newHoverTooltip(win fyne.Window, content fyne.CanvasObject, textFunc func() string) *hoverTooltip {
+	h := &hoverTooltip{content: content, textFunc: textFunc, win: win}
+	h.ExtendBaseWidget(h)
+	return h
+}
+
+func (h *hoverTooltip) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(h.content)
+}
+
+func (h *hoverTooltip) MouseIn(ev *desktop.MouseEvent) {
+	text := h.textFunc()
+	if text == "" {
+		return
+	}
+	h.popup = widget.NewPopUp(widget.NewLabel(text), h.win.Canvas())
+	h.popup.ShowAtPosition(ev.AbsolutePosition.Add(fyne.NewPos(12, 12)))
+}
+
+func (h *hoverTooltip) MouseMoved(*desktop.MouseEvent) {}
+
+func (h *hoverTooltip) MouseOut() {
+	if h.popup != nil {
+		h.popup.Hide()
+		h.popup = nil
+	}
 }
 
 // rowIndexOfItem returns item's position in e.rows, or -1.
@@ -507,6 +626,7 @@ func (e *BlockEditor) removeItem(item *todoItem) {
 	}
 	e.rows = append(e.rows[:idx], e.rows[idx+1:]...)
 	delete(e.itemEntry, item)
+	delete(e.itemCheck, item)
 	e.rebuild()
 	for i := idx - 1; i >= 0; i-- {
 		if prev := e.rows[i].item; prev != nil {
@@ -547,12 +667,14 @@ func (e *BlockEditor) newItemRow() fyne.CanvasObject {
 		if store.IsHeadingLine(text) {
 			r = &todoRow{block: &store.Block{Plaintext: strings.TrimSpace(text), Decrypted: true}}
 		} else {
+			depth := max(e.newItemDepth, min(store.IndentDepth(text), todoMaxDepth))
 			r = &todoRow{item: &todoItem{
-				depth: min(store.IndentDepth(text), todoMaxDepth),
+				depth: depth,
 				text:  strings.TrimLeft(text, " \t"),
 			}}
 		}
 		e.rows = append(e.rows, r)
+		e.newItemDepth = 0
 		e.changed()
 		e.rebuild()
 		// Keep focus on this box so items can be added one after another.
@@ -563,6 +685,16 @@ func (e *BlockEditor) newItemRow() fyne.CanvasObject {
 	entry.Wrapping = fyne.TextWrapOff
 	entry.SetPlaceHolder("New item… (or “# Heading”)")
 	entry.SetMinRowsVisible(1)
+	// Tab / Shift+Tab at the start nests / un-nests the item about to be
+	// created — same rule as an existing item (see todoItemRow's OnTab).
+	// Without this it fell through to the embedded Entry's default handling
+	// and just inserted a literal tab character instead of indenting.
+	entry.OnTab = func(shift bool) bool {
+		if entry.CursorRow == 0 && entry.CursorColumn == 0 {
+			e.shiftNewItemDepth(shift)
+		}
+		return true
+	}
 	e.newItemEntry = entry
 	entry.OnChanged = func(t string) {
 		entry.SetMinRowsVisible(todoRowLines(t))
@@ -572,7 +704,43 @@ func (e *BlockEditor) newItemRow() fyne.CanvasObject {
 	check := widget.NewCheck("", nil)
 	check.Disable()
 
-	return container.NewBorder(nil, nil, check, nil, entry)
+	indent := canvas.NewRectangle(color.Transparent)
+	indent.SetMinSize(fyne.NewSize(float32(e.newItemDepth)*todoIndentPx, 1))
+	return container.NewBorder(nil, nil, container.NewHBox(indent, check), nil, entry)
+}
+
+// shiftNewItemDepth indents (shift=false) or outdents (shift=true) the
+// pending "new item" row by one level — mirrors shiftDepth, but the item
+// doesn't exist in e.rows yet, so the clamp is against the last item
+// currently in the list instead of the row above a real todoItem.
+func (e *BlockEditor) shiftNewItemDepth(outdent bool) {
+	old := e.newItemDepth
+	if outdent {
+		if e.newItemDepth > 0 {
+			e.newItemDepth--
+		}
+	} else if e.newItemDepth < e.maxNewItemDepth() {
+		e.newItemDepth++
+	}
+	if e.newItemDepth == old {
+		return
+	}
+	e.rebuild()
+	if e.newItemEntry != nil && fyne.CurrentApp().Driver().CanvasForObject(e) != nil {
+		e.win.Canvas().Focus(e.newItemEntry)
+	}
+}
+
+// maxNewItemDepth is how deep the pending new item may nest: one past the
+// last item currently in the list (mirrors maxDepthFor), and never past
+// todoMaxDepth.
+func (e *BlockEditor) maxNewItemDepth() int {
+	for i := len(e.rows) - 1; i >= 0; i-- {
+		if prev := e.rows[i].item; prev != nil {
+			return min(prev.depth+1, todoMaxDepth)
+		}
+	}
+	return 0
 }
 
 func (e *BlockEditor) promptUnlock(b *store.Block) {

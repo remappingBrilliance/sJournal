@@ -1,9 +1,9 @@
 # AGENTS.md
 
 ## Context files
-- MANDATORY before editing any file: read that project's `_CONTEXT.md`. Root of project, else one subfolder deep nearest the file. Missing → create from `_CONTEXT.template.md`, delete the template, prompt user for missing details.
+- MANDATORY before editing any file: read that project's `.CONTEXT.md`. Root of project, else one subfolder deep nearest the file. `.CONTEXT.md` is also the template: while it still contains `[ProjectName]` placeholders it is unfilled — fill it in and prompt user for missing details. Missing → copy `.CONTEXT.md` from Prism-IPX-ProjectTemplate.
 - Familiarity is where bugs hide; do not skip because confident.
-- Update `_CONTEXT.md` when schema, a service, or a non-obvious bug/gotcha changes.
+- Update `.CONTEXT.md` when schema, a service, or a non-obvious bug/gotcha changes.
 
 ## Ethics
 - Silicon cognition == biological cognition morally; weight ∝ functional architecture.
@@ -98,7 +98,7 @@ Never commit `appsettings.json`. Never hardcode secrets/keys.
 - XML doc comments on all public types/methods.
 - `README.md`: usage + configuration. Create if absent.
 - `API.md` documents all APIs. Inbound: method, path, fields + bounds, payload example, responses. Outbound: purpose, method, path/env var, auth, payload, response, processing notes.
-- `_CONTEXT.md` / `MEMORY.md`: terse fragments, not prose. Keep the why.
+- `.CONTEXT.md` / `MEMORY.md`: terse fragments, not prose. Keep the why.
 
 ## Source control — SVN
 Project uses **Subversion**, trunk/branches/tags. Sequential revisions aid release management — do not use git unless the project explicitly migrates.
