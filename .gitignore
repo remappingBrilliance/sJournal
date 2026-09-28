@@ -8,3 +8,8 @@
 # VSCode SFTP extension workspace config - commonly holds a live host
 # password/credentials in plaintext, never commit
 .sftp.json
+
+# Live secrets - never commit (real values live in .env)
+.env
+.env.*
+!.env.example
