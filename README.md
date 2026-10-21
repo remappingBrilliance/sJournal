@@ -151,7 +151,7 @@ internal/ui/assets/  embedded icon
 packaging/           installers, Windows cross-compile, icon tooling
 ```
 
-See [`_CONTEXT.md`](_CONTEXT.md) for the hot paths and the pile of
+See [`.CONTEXT.md`](.CONTEXT.md) for the hot paths and the pile of
 platform-integration gotchas.
 
 ## License
