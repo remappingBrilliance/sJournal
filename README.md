@@ -153,3 +153,7 @@ packaging/           installers, Windows cross-compile, icon tooling
 
 See [`_CONTEXT.md`](_CONTEXT.md) for the hot paths and the pile of
 platform-integration gotchas.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
